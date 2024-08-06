@@ -1,0 +1,13 @@
+{
+  "cls_token": "[CLS]",
+  "mask_token": "[MASK]",
+  "pad_token": {
+    "content": "[PAD]",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false
+  },
+  "sep_token": "[SEP]",
+  "unk_token": "[UNK]"
+}
