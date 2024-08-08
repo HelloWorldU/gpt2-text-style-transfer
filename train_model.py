@@ -187,7 +187,7 @@ def test_step(input_ids, attention_mask, labels):
 
 # 自定义鉴别器训练步骤
 @tf.function
-def train_discriminator_step(real_ids, real_mask, generated_ids, model, optimizer, gamma=1.0):
+def train_discriminator_y_step(real_ids, real_mask, generated_ids, model, optimizer, gamma=1.0):
     with tf.GradientTape() as tape:
         real_loss = dis.compute_lm_loss(real_ids, real_mask, model)
         fake_loss = dis.compute_lm_loss(generated_ids, real_mask, model)
@@ -203,6 +203,23 @@ def discriminator_z_loss(discriminator_Z, zx, zy, label_smoothing=0.1):
     zy_loss = bce(tf.zeros_like(discriminator_Z(zy)), discriminator_Z(zy))
     return zx_loss + zy_loss
 
+@tf.function
+def train_discriminator_z_step(discriminator_Z, zx, zy, optimizer, label_smoothing):
+    with tf.GradientTape() as tape:
+        loss = discriminator_z_loss(discriminator_Z, zx, zy, label_smoothing=label_smoothing)
+    gradients = tape.gradient(loss, discriminator_Z.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, discriminator_Z.trainable_variables))
+    return loss
+
+# 生成样本训练鉴别器z
+def train_generator_with_discriminator_z(generator, discriminator_Z, input_ids_X, input_ids_Y, attention_mask_X, attention_mask_Y, 
+                                         style_ids_X, style_ids_Y, generator_optimizer, discriminator_z_optimizer, label_smoothing=0.1):
+    generated_ids_X_Z = generator.generate(input_ids_X, attention_mask=attention_mask_X, max_length=input_ids_X.shape[1] + style_ids_X.shape[1] + 20)
+    generated_ids_Y_Z = generator.generate(input_ids_Y, attention_mask=attention_mask_Y, max_length=input_ids_Y.shape[1] + style_ids_Y.shape[1] + 20)
+    disc_z_loss_X = train_discriminator_z_step(discriminator_Z, input_ids_X, generated_ids_X_Z, discriminator_z_optimizer, label_smoothing)
+    disc_z_loss_Y = train_discriminator_z_step(discriminator_Z, input_ids_Y, generated_ids_Y_Z, discriminator_z_optimizer, label_smoothing)
+    return disc_z_loss_X, disc_z_loss_Y
+
 # REINFORCE算法
 @tf.function
 def reinforce_step(input_ids, attention_mask, style_ids, generator, language_model, generator_optimizer):
@@ -213,7 +230,7 @@ def reinforce_step(input_ids, attention_mask, style_ids, generator, language_mod
         outputs = generator(input_ids, attention_mask=attention_mask, labels=style_ids)
         logits = outputs.logits
         log_probs = tf.nn.log_softmax(logits, axis=-1)
-        # 这里假设 style_ids 是目标风格文本的 token ids
+        # 假设 style_ids 是目标风格文本的 token ids
         mask = tf.sequence_mask(style_ids, maxlen=tf.shape(logits)[-2])
         masked_log_probs = tf.boolean_mask(log_probs, mask)
         log_prob = tf.reduce_mean(masked_log_probs)
@@ -273,12 +290,6 @@ valid_dataset_Y = tf.data.Dataset.from_tensor_slices((
 ).batch(batch_size)
 
 
-discriminator_dataset_X = tf.data.Dataset.from_tensor_slices((
-    tf.cast(train_input_ids_X, tf.int32),
-    tf.cast(train_attention_mask_X, tf.int32),
-    tf.cast(train_labels_X, tf.int32),
-    tf.cast(train_styles_X, tf.int32))
-).batch(batch_size)
 discriminator_dataset_Y = tf.data.Dataset.from_tensor_slices((
     tf.cast(train_input_ids_Y, tf.int32),
     tf.cast(train_attention_mask_Y, tf.int32),
@@ -316,30 +327,31 @@ for epoch in range(epochs):
     total_accuracy = tf.constant(0.0, dtype=tf.float32)
     total_reinforce_loss = tf.constant(0.0, dtype=tf.float32)
     num_batches = 0
-    combined_dataset = zip(train_dataset_X, discriminator_dataset_X, discriminator_dataset_Y, discriminator_dataset_X_Z, discriminator_dataset_Y_Z)
+    combined_dataset = zip(train_dataset_X, train_dataset_Y, discriminator_dataset_Y, discriminator_dataset_X_Z, discriminator_dataset_Y_Z)
     # 生成器鉴别器交替训练
-    for (batch_input_ids, batch_attention_mask, batch_labels), (batch_real_ids_X, batch_real_mask_X, _), (
-        batch_real_ids_Y, batch_real_mask_Y, _), (batch_real_ids_X_Z, batch_real_mask_X_Z, _), (
-        batch_real_ids_Y_Z, batch_real_mask_Y_Z, _) in combined_dataset:
+    for (batch_input_ids_X, batch_attention_mask_X, batch_labels_X), (batch_input_ids_Y, batch_attention_mask_Y, batch_labels_Y), (
+        batch_real_ids_Y,batch_real_mask_Y, batch_real_labels_Y), (batch_real_ids_X_Z, batch_real_mask_X_Z, batch_real_labels_X_Z), (
+            batch_real_ids_Y_Z, batch_real_mask_Y_Z, batch_real_labels_Y_Z) in combined_dataset:
         # 生成器
         gen_loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy = train_generator_step(
-            generator, discriminator_Y, batch_input_ids, batch_attention_mask, 
-            batch_labels, tf.cast(step, tf.float32), accumulation_steps, 
+            generator, discriminator_Y, batch_input_ids_X, batch_attention_mask_X, 
+            batch_labels_X, tf.cast(step, tf.float32), accumulation_steps, 
             lambda_rec, lambda_lm, lambda_adv, lambda_kl, gamma)
         style_ids = tf.constant([[tokenizer.bos_token_id]] * batch_size)
         reinforce_loss = reinforce_step(batch_input_ids, batch_attention_mask, style_ids, generator, discriminator_Y, generator_optimizer)
         # 鉴别器
-        # generated_ids_X = generator.generate(batch_real_ids_X, attention_mask=batch_real_mask_X, max_length=batch_real_ids_X.shape[1]+20)
-        # disc_loss_X, real_loss_X, fake_loss_X = train_discriminator_step(batch_real_ids_X, batch_real_mask_X, generated_ids_X, discriminator_X, 
-        #                                                                  discriminator_optimizer)
         generated_ids_Y = generator.generate(batch_real_ids_Y, attention_mask=batch_real_mask_Y, max_length=batch_real_ids_Y.shape[1]+20)
-        disc_loss_Y, real_loss_Y, fake_loss_Y = train_discriminator_step(batch_real_ids_Y, batch_real_mask_Y, generated_ids_Y, discriminator_Y, 
+        disc_loss_Y, real_loss_Y, fake_loss_Y = train_discriminator_y_step(batch_real_ids_Y, batch_real_mask_Y, generated_ids_Y, discriminator_Y, 
                                                                          discriminator_optimizer)
+        
+        disc_z_loss_X, disc_z_loss_Y = train_generator_with_discriminator_z(generator, discriminator_Z, batch_real_ids_X_Z, batch_real_ids_Y_Z, 
+                                                                           batch_real_mask_X_Z, batch_real_mask_Y_Z, batch_styles_X_Z, batch_styles_Y_Z, 
+                                                                           generator_optimizer, discriminator_z_optimizer)
         generated_ids_X_Z = generator.generate(batch_real_ids_X_Z, attention_mask=batch_real_mask_X_Z, max_length=batch_real_ids_X_Z.shape[1]+20)
-        disc_z_loss_X, real_z_loss_X, fake_z_loss_X = train_discriminator_step(batch_real_ids_X_Z, batch_real_mask_X_Z, generated_ids_X_Z, 
+        disc_z_loss_X, real_z_loss_X, fake_z_loss_X = train_discriminator_z_step(batch_real_ids_X_Z, batch_real_mask_X_Z, generated_ids_X_Z, 
                                                                                  discriminator_Z, discriminator_z_optimizer)
         generated_ids_Y_Z = generator.generate(batch_real_ids_Y_Z, attention_mask=batch_real_mask_Y_Z, max_length=batch_real_ids_Y_Z.shape[1]+20)
-        disc_z_loss_Y, real_z_loss_Y, fake_z_loss_Y = train_discriminator_step(batch_real_ids_Y_Z, batch_real_mask_Y_Z, generated_ids_Y_Z, 
+        disc_z_loss_Y, real_z_loss_Y, fake_z_loss_Y = train_discriminator_z_step(batch_real_ids_Y_Z, batch_real_mask_Y_Z, generated_ids_Y_Z, 
                                                                                  discriminator_Z, discriminator_z_optimizer)
         total_gen_loss += gen_loss
         total_rec_loss += rec_loss
