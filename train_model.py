@@ -344,6 +344,8 @@ for epoch in range(epochs):
         disc_loss_Y, real_loss_Y, fake_loss_Y = train_discriminator_y_step(batch_real_ids_Y, batch_real_mask_Y, generated_ids_Y, discriminator_Y, 
                                                                          discriminator_optimizer)
         
+        batch_styles_X_Z = tf.constant([0] * batch_size, dtype=tf.int32)
+        batch_styles_Y_Z = tf.constant([1] * batch_size, dtype=tf.int32)
         disc_z_loss_X, disc_z_loss_Y = train_generator_with_discriminator_z(generator, discriminator_Z, batch_real_ids_X_Z, batch_real_ids_Y_Z, 
                                                                            batch_real_mask_X_Z, batch_real_mask_Y_Z, batch_styles_X_Z, batch_styles_Y_Z, 
                                                                            generator_optimizer, discriminator_z_optimizer)
