@@ -83,11 +83,11 @@ generator_optimizer = tf.keras.optimizers.Adam(learning_rate=final_lr_schedule)
 
 accumulated_gradients = None
 
-# 自定义生成器训练验证和测试步骤
+# 自定义生成器训练步骤
 # Only X->Y
 @tf.function
-def train_generator_step(generator, discriminator_Y, input_ids, attention_mask, labels, styles, step, accumulation_steps=4, lambda_rec=1.0, lambda_lm=1.0, 
-                         lambda_adv=1.0, lambda_kl=1.0, gamma=1.0):
+def train_generator_step(generator, discriminator_Y, input_ids, attention_mask, labels, styles, step, accumulation_steps=4, lambda_rec=1.0, 
+                         lambda_lm=1.0, lambda_adv=1.0, lambda_kl=1.0, gamma=1.0):
     global accumulated_gradients
     def step_fn():
         with tf.GradientTape() as tape:
@@ -159,31 +159,6 @@ def train_generator_step(generator, discriminator_Y, input_ids, attention_mask, 
             current_lr,
             total_accuracy / tf.cast(accumulation_steps, tf.float32))
 
-@tf.function
-def valid_step(input_ids, attention_mask, labels):
-    outputs = generator(input_ids, attention_mask=attention_mask, training=False)
-    logits = outputs.logits
-    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
-    mask = tf.cast(labels != -100, logits.dtype)
-    loss = loss_fn(tf.where(labels == -100, 0, labels), logits)
-    loss = tf.reduce_sum(loss * mask) / tf.reduce_sum(mask)
-    predictions=tf.argmax(logits, axis=-1)
-    predictions=tf.cast(predictions,tf.int32)
-    accuracy=tf.reduce_sum(tf.cast(tf.equal(predictions,labels),tf.float32)*mask)/tf.reduce_sum(mask)
-    return tf.cast(loss, tf.float32),accuracy
-
-@tf.function
-def test_step(input_ids, attention_mask, labels):
-    outputs = generator(input_ids, attention_mask=attention_mask, training=False)
-    logits = outputs.logits
-    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
-    mask = tf.cast(labels != -100, logits.dtype)
-    loss = loss_fn(tf.where(labels == -100, 0, labels), logits)
-    loss = tf.reduce_sum(loss * mask) / tf.reduce_sum(mask)
-    predictions = tf.argmax(logits, axis=-1)
-    predictions = tf.cast(predictions, tf.int32)
-    accuracy = tf.reduce_sum(tf.cast(tf.equal(predictions, labels), tf.float32)*mask)/tf.reduce_sum(mask)
-    return tf.cast(loss, tf.float32), accuracy
 
 # 自定义鉴别器训练步骤
 @tf.function
@@ -329,32 +304,25 @@ for epoch in range(epochs):
     num_batches = 0
     combined_dataset = zip(train_dataset_X, train_dataset_Y, discriminator_dataset_Y, discriminator_dataset_X_Z, discriminator_dataset_Y_Z)
     # 生成器鉴别器交替训练
-    for (batch_input_ids_X, batch_attention_mask_X, batch_labels_X), (batch_input_ids_Y, batch_attention_mask_Y, batch_labels_Y), (
-        batch_real_ids_Y,batch_real_mask_Y, batch_real_labels_Y), (batch_real_ids_X_Z, batch_real_mask_X_Z, batch_real_labels_X_Z), (
-            batch_real_ids_Y_Z, batch_real_mask_Y_Z, batch_real_labels_Y_Z) in combined_dataset:
+    for (batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X), (batch_input_ids_Y, batch_attention_mask_Y, batch_labels_Y, 
+            batch_styles_Y), (batch_real_ids_Y,batch_real_mask_Y, batch_real_labels_Y, batch_real_styles_Y), (batch_real_ids_X_Z, 
+            batch_real_mask_X_Z, batch_real_labels_X_Z, batch_real_styles_X_Z), (batch_real_ids_Y_Z, batch_real_mask_Y_Z, batch_real_labels_Y_Z, 
+            batch_real_styles_Y_Z) in combined_dataset:
+        
         # 生成器
-        gen_loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy = train_generator_step(
-            generator, discriminator_Y, batch_input_ids_X, batch_attention_mask_X, 
-            batch_labels_X, tf.cast(step, tf.float32), accumulation_steps, 
-            lambda_rec, lambda_lm, lambda_adv, lambda_kl, gamma)
-        style_ids = tf.constant([[tokenizer.bos_token_id]] * batch_size)
-        reinforce_loss = reinforce_step(batch_input_ids, batch_attention_mask, style_ids, generator, discriminator_Y, generator_optimizer)
+        gen_loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy = train_generator_step(generator, discriminator_Y, 
+            batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X, tf.cast(step, tf.float32), 
+            accumulation_steps, lambda_rec, lambda_lm, lambda_adv, lambda_kl, gamma)
+        reinforce_loss = reinforce_step(batch_input_ids, batch_attention_mask, batch_styles_X, generator, discriminator_Y, generator_optimizer)
+
         # 鉴别器
         generated_ids_Y = generator.generate(batch_real_ids_Y, attention_mask=batch_real_mask_Y, max_length=batch_real_ids_Y.shape[1]+20)
         disc_loss_Y, real_loss_Y, fake_loss_Y = train_discriminator_y_step(batch_real_ids_Y, batch_real_mask_Y, generated_ids_Y, discriminator_Y, 
                                                                          discriminator_optimizer)
         
-        batch_styles_X_Z = tf.constant([0] * batch_size, dtype=tf.int32)
-        batch_styles_Y_Z = tf.constant([1] * batch_size, dtype=tf.int32)
         disc_z_loss_X, disc_z_loss_Y = train_generator_with_discriminator_z(generator, discriminator_Z, batch_real_ids_X_Z, batch_real_ids_Y_Z, 
-                                                                           batch_real_mask_X_Z, batch_real_mask_Y_Z, batch_styles_X_Z, batch_styles_Y_Z, 
-                                                                           generator_optimizer, discriminator_z_optimizer)
-        generated_ids_X_Z = generator.generate(batch_real_ids_X_Z, attention_mask=batch_real_mask_X_Z, max_length=batch_real_ids_X_Z.shape[1]+20)
-        disc_z_loss_X, real_z_loss_X, fake_z_loss_X = train_discriminator_z_step(batch_real_ids_X_Z, batch_real_mask_X_Z, generated_ids_X_Z, 
-                                                                                 discriminator_Z, discriminator_z_optimizer)
-        generated_ids_Y_Z = generator.generate(batch_real_ids_Y_Z, attention_mask=batch_real_mask_Y_Z, max_length=batch_real_ids_Y_Z.shape[1]+20)
-        disc_z_loss_Y, real_z_loss_Y, fake_z_loss_Y = train_discriminator_z_step(batch_real_ids_Y_Z, batch_real_mask_Y_Z, generated_ids_Y_Z, 
-                                                                                 discriminator_Z, discriminator_z_optimizer)
+        batch_real_mask_X_Z, batch_real_mask_Y_Z, batch_real_styles_X_Z, batch_real_styles_Y_Z, generator_optimizer, discriminator_z_optimizer)
+        
         total_gen_loss += gen_loss
         total_rec_loss += rec_loss
         total_lm_loss += lm_loss
@@ -367,12 +335,13 @@ for epoch in range(epochs):
         num_batches += 1
         step += 1
         learning_rates.append(current_lr.numpy())
+        
     # 验证循环
     total_valid_loss = tf.constant(0.0, dtype=tf.float32)
     total_valid_accuracy = tf.constant(0.0, dtype=tf.float32)
     num_valid_batches = 0
     for batch_input_ids, batch_attention_mask, batch_labels in valid_dataset_X:
-        loss, accuracy = valid_step(batch_input_ids, batch_attention_mask, batch_labels)
+        loss, accuracy = ex.valid_step(generator, batch_input_ids, batch_attention_mask, batch_labels)
         total_valid_loss += loss
         total_valid_accuracy += accuracy
         num_valid_batches += 1
@@ -416,7 +385,7 @@ test_dataset=tf.data.Dataset.from_tensor_slices((
     tf.cast(test_attention_mask, tf.int32),
     tf.cast(test_labels, tf.int32)
 )).batch(batch_size)
-ex.test_evalution(test_step,test_dataset)
+ex.test_evalution(ex.test_step,test_dataset)
 
 # 保存绘图
 save_dir = './experiment'
