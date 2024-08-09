@@ -21,16 +21,18 @@ def compute_discriminator_loss(real_texts, generated_texts, model, tokenizer, ga
     loss_generated = -tf.reduce_mean(tf.math.log(generated_perplexity))
     return loss_real + gamma * loss_generated
 
-def compute_lm_loss(input_ids,language_model):
-    outputs=language_model(input_ids,training=False)
-    logits=outputs.logits
-    shift_logits=logits[:,:-1,:]
-    shift_labels=input_ids[:,1:]
-    loss_fn=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True,reduction='none')
-    loss=loss_fn(shift_labels,shift_logits)
-    return tf.recude_mean(loss)
+def compute_lm_loss(input_ids, real_mask, language_model):
+    outputs = language_model(input_ids, attention_mask=real_mask, training=False)
+    logits = outputs.logits
+    shift_logits = logits[:,:-1,:]
+    shift_labels = input_ids[:,1:]
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
+    loss=loss_fn(shift_labels, shift_logits)
+    return tf.reduce_mean(loss)
 
 # 鉴别器数据处理函数
 def encode_texts(texts, tokenizer, max_length=512):
     inputs = tokenizer(texts, return_tensors='tf', max_length=max_length, padding='max_length', truncation=True)
     return inputs['input_ids'], inputs['attention_mask']
+
+
