@@ -93,36 +93,49 @@ def generate_text(model, tokenizer, prompt, max_length=50):
     return generated_text
 
 # 准备数据集
-def load_dataset(file_path, test_file_path, tokenizer, split_ratio=0.9, seed=None):
+def load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, split_ratio=0.9, seed=None):
     if seed is not None:
         random.seed(seed)
 
-    with open(file_path, 'r', encoding='utf-8') as f:
-        lines = f.read().splitlines()
+    with open(file_path_X, 'r', encoding='utf-8') as fx:
+        lines_X = fx.read().splitlines()
+    random.shuffle(lines_X)
+    split = int(len(lines_X) * split_ratio)
+    train_lines_X = [(line, 0) for line in lines_X[:split]]  # 风格 0
+    valid_lines_X = [(line, 0) for line in lines_X[split:]]
 
-    random.shuffle(lines)
+    with open(file_path_Y, 'r', encoding='utf-8') as fy:
+        lines_Y = fy.read().splitlines()
+    random.shuffle(lines_Y)
+    split = int(len(lines_Y) * split_ratio)
+    train_lines_Y = [(line, 1) for line in lines_Y[:split]]  # 风格 1
+    valid_lines_Y = [(line, 1) for line in lines_Y[split:]]
 
-    split = int(len(lines)*split_ratio)
-    train_lines = lines[:split]
-    valid_lines = lines[split:]
-
-    train_dataset = tokenizer(train_lines, return_tensors='tf', truncation=True, padding=True, pad_to_multiple_of=8)
-    valid_dataset = tokenizer(valid_lines, return_tensors='tf', truncation=True, padding=True, pad_to_multiple_of=8)
-
-    with open(test_file_path, 'r', encoding='utf-8') as f:
-        test_lines = f.read().splitlines()
-    
+    with open(test_file_path, 'r', encoding='utf-8') as f_test:
+        test_lines = f_test.read().splitlines()
     test_dataset = tokenizer(test_lines, return_tensors='tf', truncation=True, padding=True, pad_to_multiple_of=8)
 
-    return train_dataset, valid_dataset, test_dataset
+    train_dataset_X = tokenizer([line for line, _ in train_lines_X], return_tensors='tf', truncation=True, padding=True, pad_to_multiple_of=8)
+    valid_dataset_X = tokenizer([line for line, _ in valid_lines_X], return_tensors='tf', truncation=True, padding=True, pad_to_multiple_of=8)
+    train_dataset_Y = tokenizer([line for line, _ in train_lines_Y], return_tensors='tf', truncation=True, padding=True, pad_to_multiple_of=8)
+    valid_dataset_Y = tokenizer([line for line, _ in valid_lines_Y], return_tensors='tf', truncation=True, padding=True, pad_to_multiple_of=8)
 
-# 创建输入数据
-def prepare_input_data(dataset):
+    train_styles_X = tf.constant([style for _, style in train_lines_X], dtype=tf.int32)
+    valid_styles_X = tf.constant([style for _, style in valid_lines_X], dtype=tf.int32)
+    train_styles_Y = tf.constant([style for _, style in train_lines_Y], dtype=tf.int32)
+    valid_styles_Y = tf.constant([style for _, style in valid_lines_Y], dtype=tf.int32)
+
+    return (train_dataset_X, train_styles_X), (train_dataset_Y, train_styles_Y), (
+        valid_dataset_X, valid_styles_X), (valid_dataset_Y, valid_styles_Y), test_dataset
+
+
+# 教师强制
+def prepare_input_data(dataset, styles):
     input_ids = dataset['input_ids']
     attention_mask = dataset['attention_mask']
     labels = tf.roll(input_ids, shift=-1, axis=1)
     labels = tf.where(attention_mask == 0, -100, labels)  # 使用-100来忽略填充标记
-    return input_ids, attention_mask, labels
+    return input_ids, attention_mask, labels, styles
 
 # 测试集评估函数
 def test_evalution(test_step,dataset):
@@ -139,3 +152,38 @@ def test_evalution(test_step,dataset):
     test_perplexity=tf.exp(avg_test_loss).numpy()
     print(f"Test Loss: {avg_test_loss}, Test Accuracy: {avg_test_accuracy}")
     print(f"Test Perplexity: {test_perplexity}")
+
+# KL散度正则化
+def kl_divergence(p, q):
+    return tf.reduce_sum(p * tf.math.log(p / q))
+
+import tensorflow as tf
+from transformers import TFBertModel, BertTokenizer
+
+# 初始化编码器模型和分词器
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+encoder_model = TFBertModel.from_pretrained('bert-base-uncased')
+
+# 定义计算内容分布的函数
+def compute_distribution(input_ids):
+    outputs = encoder_model(input_ids)
+    hidden_states = outputs.last_hidden_state
+    content_vector = tf.reduce_mean(hidden_states, axis=1)
+    return content_vector
+
+# 绘制生成器鉴别器的各个损失
+def plot_losses(rec_losses, lm_losses, adv_losses, kl_losses, disc_losses, disc_z_losses, save_dir):
+    plt.figure(figsize=(12, 8))
+    plt.plot(rec_losses, label='Reconstruction Loss')
+    plt.plot(lm_losses, label='Language Model Loss')
+    plt.plot(adv_losses, label='Adversarial Loss')
+    plt.plot(kl_losses, label='KL Divergence Loss')
+    plt.plot(disc_losses, label='Discriminator Loss')
+    plt.plot(disc_z_losses, label='Discriminator Z Loss')
+    plt.xlabel('Steps')
+    plt.ylabel('Loss')
+    plt.title('Training Losses')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, 'losses.png'))
+    plt.close()
