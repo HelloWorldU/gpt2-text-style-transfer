@@ -4,34 +4,23 @@ import os
 import experiment as ex
 import discriminator as dis
 
-# 禁用 GPU
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-
-# # 混合精度训练
-# from tensorflow.keras import mixed_precision
-# policy = mixed_precision.Policy('mixed_float16')
-# mixed_precision.set_global_policy(policy)
-
 # 加载预训练模型和分词器
-model_name = "uer/gpt2-chinese-cluecorpussmall"
-tokenizer = BertTokenizer.from_pretrained(model_name)
-generator = TFGPT2LMHeadModel.from_pretrained(model_name)
-# discriminator_X = TFGPT2LMHeadModel.from_pretrained(model_name)
-discriminator_Y = TFGPT2LMHeadModel.from_pretrained(model_name)
-tokenizer_Z = BertTokenizer.from_pretrained('bert-base-chinese')
+model_path = "./repository/"
+tokenizer = BertTokenizer.from_pretrained(model_path)
+generator = TFGPT2LMHeadModel.from_pretrained(model_path)
+discriminator_Y = TFGPT2LMHeadModel.from_pretrained(model_path)
 discriminator_Z = tf.keras.models.Sequential([
     tf.keras.layers.Dense(256, activation='relu'),
     tf.keras.layers.Dense(128, activation='relu'),
     tf.keras.layers.Dense(1, activation='sigmoid')
 ])
-# discriminator_Z = tf.keras.models.load_model('./model/discriminator_Z')
 
-# 添加 pad_token
 special_tokens_dict = {'pad_token': '[PAD]'}
 num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
 
 # 调整模型的词嵌入大小
 generator.resize_token_embeddings(len(tokenizer))
+discriminator_Y.resize_token_embeddings(len(tokenizer))
 
 # 获取当前文件路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -41,19 +30,13 @@ test_file_path = os.path.join(current_dir, './corpus/test_corpus.txt')
 
 # 加载数据集
 (train_dataset_X, train_styles_X), (train_dataset_Y, train_styles_Y), (valid_dataset_X, valid_styles_X), (
-    valid_dataset_Y, valid_styles_Y), test_dataset = ex.load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, seed=42)
-(train_dataset_X_Z, train_styles_X_Z), (train_dataset_Y_Z, train_styles_Y_Z), (valid_dataset_X_Z, valid_styles_X_Z), (
-    valid_dataset_Y_Z, valid_styles_Y_Z), test_dataset_Z = ex.load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer_Z, seed=42)
+    valid_dataset_Y, valid_styles_Y), (test_dataset, test_styles) = ex.load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, seed=42)
 
 # 创建输入数据
 train_input_ids_X, train_attention_mask_X, train_labels_X, train_styles_X = ex.prepare_input_data(train_dataset_X, train_styles_X)
 train_input_ids_Y, train_attention_mask_Y, train_labels_Y, train_styles_Y = ex.prepare_input_data(train_dataset_Y, train_styles_Y)
-train_input_ids_X_Z, train_attention_mask_X_Z, train_labels_X, train_styles_X_Z = ex.prepare_input_data(train_dataset_X_Z, train_styles_X_Z)
-train_input_ids_Y_Z, train_attention_mask_Y_Z, train_labels_Y, train_styles_Y_Z = ex.prepare_input_data(train_dataset_Y_Z, train_styles_Y_Z)
 valid_input_ids_X, valid_attention_mask_X, valid_labels_X, valid_styles_X = ex.prepare_input_data(valid_dataset_X, valid_styles_X)
 valid_input_ids_Y, valid_attention_mask_Y, valid_labels_Y, valid_styles_Y = ex.prepare_input_data(valid_dataset_Y, valid_styles_Y)
-valid_input_ids_X_Z, valid_attention_mask_X_Z, valid_labels_X, valid_styles_X_Z = ex.prepare_input_data(valid_dataset_X_Z, valid_styles_X_Z)
-valid_input_ids_Y_Z, valid_attention_mask_Y_Z, valid_labels_Y, valid_styles_Y_Z = ex.prepare_input_data(valid_dataset_Y_Z, valid_styles_Y_Z)
 
 # 动态 Padding
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
@@ -79,49 +62,79 @@ final_lr_schedule = ex.WarmUpDecay(
 )
 
 generator_optimizer = tf.keras.optimizers.Adam(learning_rate=final_lr_schedule)
-# optimizer = mixed_precision.LossScaleOptimizer(optimizer)
 
 accumulated_gradients = None
 
 # 自定义生成器训练步骤
 # Only X->Y
-@tf.function
+# @tf.function
 def train_generator_step(generator, discriminator_Y, input_ids, attention_mask, labels, styles, step, accumulation_steps=4, lambda_rec=1.0, 
-                         lambda_lm=1.0, lambda_adv=1.0, lambda_kl=1.0, gamma=1.0):
+                         lambda_lm=1.0, lambda_adv=1.0, lambda_kl=1.0, gamma=1.0): 
     global accumulated_gradients
     def step_fn():
         with tf.GradientTape() as tape:
             # 嵌入风格标签
             style_embeddings = tf.keras.layers.Embedding(input_dim=2, output_dim=generator.config.n_embd)(styles)
-            style_embeddings = tf.expand_dims(style_embeddings, axis=1)
-            extended_input_ids = tf.concat([style_embeddings, input_ids], axis=1)
-            extended_attention_mask = tf.concat([tf.ones_like(styles, dtype=attention_mask.dtype), attention_mask], axis=1)
+            style_embeddings = tf.expand_dims(style_embeddings, axis=1) # [batch_size, 1, n_embd]
+            print("Style embeddings shape:", style_embeddings.shape)  # Debug info
+            
+            # 将输入 ID 嵌入到相同的嵌入空间
+            input_embeddings = generator.transformer.wte(input_ids) # [batch_size, seq_len, n_embd]
+            print("Input embeddings shape:", input_embeddings.shape)  # Debug info
+            
+            extended_embeddings = tf.concat([style_embeddings, input_embeddings], axis=1)
+            print("Extended embeddings shape:", extended_embeddings.shape)  # Debug info
 
-            outputs = generator(extended_input_ids, attention_mask=extended_attention_mask, training=True)
+            style_attention_mask = tf.ones((styles.shape[0], 1), dtype=attention_mask.dtype) # [batch_size, 1]
+            print("Style attention mask shape:", style_attention_mask.shape)  # Debug info
+            extended_attention_mask = tf.concat([style_attention_mask, attention_mask], axis=1)
+            print("Extended attention mask shape:", extended_attention_mask.shape)  # Debug info
+
+            outputs = generator(extended_embeddings, attention_mask=extended_attention_mask, training=True)
             logits = outputs.logits
+            print("Logits shape:", logits.shape)  # Debug info
+
+            extended_labels = tf.pad(labels, [[0,0], [1,0]], constant_values=-100)
+            print("Extended labels shape:", extended_labels.shape)  # Debug info
+
             loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
-            mask = tf.cast(labels != -100, logits.dtype)
+            mask = tf.cast(extended_labels != -100, logits.dtype)
+            print("Mask shape:", mask.shape)  # Debug info
 
             # 各个损失
-            rec_loss = loss_fn(tf.where(labels == -100, 0, labels), logits)
+            rec_loss = loss_fn(tf.where(extended_labels == -100, 0, extended_labels), logits)
             rec_loss = tf.reduce_sum(rec_loss * mask) / tf.reduce_sum(mask)
-            generated_ids = generator.generate(extended_input_ids, max_length=input_ids.shape[1]+20)
-            input_ids_Z = tokenizer_Z(input_ids, return_tensors='tf', padding=True, truncation=True)['input_ids']
-            generated_ids_Z = tokenizer_Z(generated_ids, return_tensors='tf', padding=True, truncation=True)['input_ids']
-            zx_distribution = ex.compute_distribution(input_ids_Z)
-            zy_distribution = ex.compute_distribution(generated_ids_Z)
+            print("Reconstruction loss:", rec_loss)  # Debug info
+
+            generated_ids = generator.generate(extended_embeddings, max_length=input_ids.shape[1]+20)
+            print("Generated IDs shape:", generated_ids.shape)  # Debug info
+
+            zx_distribution = ex.compute_distribution(extended_embeddings, discriminator_Z)
+            zy_distribution = ex.compute_distribution(generated_ids, discriminator_Z)
             kl_loss = ex.kl_divergence(zx_distribution, zy_distribution)
+            print("KL loss:", kl_loss)  # Debug info
+
             real_lm_loss_Y = dis.compute_lm_loss(generated_ids, extended_attention_mask, discriminator_Y)
             lm_loss = gamma * real_lm_loss_Y
-            real_adv_loss = discriminator_Y(input_ids, attention_mask=attention_mask,training=True)
-            generated_adv_loss = discriminator_Y(generated_ids, attention_mask=attention_mask,training=True)
+            print("LM loss:", lm_loss)  # Debug info
+
+            real_adv_loss = discriminator_Y(extended_embeddings, attention_mask=extended_attention_mask, training=True)
+            generated_adv_loss = discriminator_Y(generated_ids, attention_mask=attention_mask, training=True)
             adv_loss = real_adv_loss + generated_adv_loss
+            print("Adversarial loss:", adv_loss)  # Debug info
+
             total_loss = lambda_rec * rec_loss - lambda_lm * lm_loss + lambda_adv * adv_loss + lambda_kl * kl_loss
+            print("Total loss:", total_loss)  # Debug info
+
             predictions = tf.argmax(logits, axis=-1)
             predictions = tf.cast(predictions, tf.int32)
             accuracy = tf.reduce_sum(tf.cast(tf.equal(predictions, labels), tf.float32) * mask) / tf.reduce_sum(mask)
+            print("Accuracy:", accuracy)  # Debug info
+            
         gradients = tape.gradient(total_loss, generator.trainable_variables)
+        print("Gradients calculated")  # Debug info
         return total_loss, rec_loss, lm_loss, adv_loss, kl_loss, gradients, accuracy
+
     
     if accumulated_gradients is None:
         accumulated_gradients = [tf.Variable(tf.zeros_like(g), trainable=False) for g in generator.trainable_variables]
@@ -197,16 +210,15 @@ def train_generator_with_discriminator_z(generator, discriminator_Z, input_ids_X
 
 # REINFORCE算法
 @tf.function
-def reinforce_step(input_ids, attention_mask, style_ids, generator, language_model, generator_optimizer):
+def reinforce_step(input_ids, attention_mask, labels, style_ids, generator, language_model, generator_optimizer):
     with tf.GradientTape() as tape:
-        generated_ids = generator.generate(input_ids, attention_mask=attention_mask, max_length=input_ids.shape[1]+style_ids.shape[1]+20)
+        generated_ids = generator.generate(input_ids, attention_mask=attention_mask, max_length=input_ids.shape[1] + style_ids.shape[1] + 20)
         lm_loss = dis.compute_lm_loss(generated_ids, language_model)
         # 计算生成器生成文本的对数概率
-        outputs = generator(input_ids, attention_mask=attention_mask, labels=style_ids)
+        outputs = generator(input_ids, attention_mask=attention_mask, labels=labels, training=False)
         logits = outputs.logits
         log_probs = tf.nn.log_softmax(logits, axis=-1)
-        # 假设 style_ids 是目标风格文本的 token ids
-        mask = tf.sequence_mask(style_ids, maxlen=tf.shape(logits)[-2])
+        mask = tf.sequence_mask(labels, maxlen=tf.shape(logits)[-2])
         masked_log_probs = tf.boolean_mask(log_probs, mask)
         log_prob = tf.reduce_mean(masked_log_probs)
         loss = -lm_loss  * log_prob
@@ -216,7 +228,7 @@ def reinforce_step(input_ids, attention_mask, style_ids, generator, language_mod
 
 # 训练参数
 epochs = 10
-batch_size = 16
+batch_size = 2
 accumulation_steps = 2
 lambda_rec = 1.0
 lambda_lm = 1.0
@@ -271,18 +283,6 @@ discriminator_dataset_Y = tf.data.Dataset.from_tensor_slices((
     tf.cast(train_labels_Y, tf.int32),
     tf.cast(train_styles_Y, tf.int32))
 ).batch(batch_size)
-discriminator_dataset_X_Z = tf.data.Dataset.from_tensor_slices((
-    tf.cast(train_input_ids_X_Z, tf.int32),
-    tf.cast(train_attention_mask_X_Z, tf.int32),
-    tf.cast(train_labels_X, tf.int32),
-    tf.cast(train_styles_X_Z), tf.int32)
-).batch(batch_size)
-discriminator_dataset_Y_Z = tf.data.Dataset.from_tensor_slices((
-    tf.cast(train_input_ids_Y_Z, tf.int32),
-    tf.cast(train_attention_mask_Y_Z, tf.int32),
-    tf.cast(train_labels_Y, tf.int32),
-    tf.cast(train_styles_Y_Z), tf.int32)
-).batch(batch_size)
 
 # 加载鉴别器模型参数
 discriminator_z_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
@@ -302,26 +302,24 @@ for epoch in range(epochs):
     total_accuracy = tf.constant(0.0, dtype=tf.float32)
     total_reinforce_loss = tf.constant(0.0, dtype=tf.float32)
     num_batches = 0
-    combined_dataset = zip(train_dataset_X, train_dataset_Y, discriminator_dataset_Y, discriminator_dataset_X_Z, discriminator_dataset_Y_Z)
+    combined_dataset = zip(train_dataset_X, train_dataset_Y, discriminator_dataset_Y)
     # 生成器鉴别器交替训练
     for (batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X), (batch_input_ids_Y, batch_attention_mask_Y, batch_labels_Y, 
-            batch_styles_Y), (batch_real_ids_Y,batch_real_mask_Y, batch_real_labels_Y, batch_real_styles_Y), (batch_real_ids_X_Z, 
-            batch_real_mask_X_Z, batch_real_labels_X_Z, batch_real_styles_X_Z), (batch_real_ids_Y_Z, batch_real_mask_Y_Z, batch_real_labels_Y_Z, 
-            batch_real_styles_Y_Z) in combined_dataset:
+            batch_styles_Y), (batch_real_ids_Y,batch_real_mask_Y, batch_real_labels_Y, batch_real_styles_Y) in combined_dataset:
         
         # 生成器
         gen_loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy = train_generator_step(generator, discriminator_Y, 
             batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X, tf.cast(step, tf.float32), 
             accumulation_steps, lambda_rec, lambda_lm, lambda_adv, lambda_kl, gamma)
-        reinforce_loss = reinforce_step(batch_input_ids, batch_attention_mask, batch_styles_X, generator, discriminator_Y, generator_optimizer)
+        reinforce_loss = reinforce_step(batch_input_ids, batch_attention_mask, batch_labels_X,batch_styles_X, generator, 
+            discriminator_Y, generator_optimizer)
 
         # 鉴别器
         generated_ids_Y = generator.generate(batch_real_ids_Y, attention_mask=batch_real_mask_Y, max_length=batch_real_ids_Y.shape[1]+20)
-        disc_loss_Y, real_loss_Y, fake_loss_Y = train_discriminator_y_step(batch_real_ids_Y, batch_real_mask_Y, generated_ids_Y, discriminator_Y, 
-                                                                         discriminator_optimizer)
+        disc_loss_Y, real_loss_Y, fake_loss_Y = train_discriminator_y_step(batch_real_ids_Y, batch_real_mask_Y, generated_ids_Y, discriminator_Y, discriminator_optimizer)
         
-        disc_z_loss_X, disc_z_loss_Y = train_generator_with_discriminator_z(generator, discriminator_Z, batch_real_ids_X_Z, batch_real_ids_Y_Z, 
-        batch_real_mask_X_Z, batch_real_mask_Y_Z, batch_real_styles_X_Z, batch_real_styles_Y_Z, generator_optimizer, discriminator_z_optimizer)
+        disc_z_loss_X, disc_z_loss_Y = train_generator_with_discriminator_z(generator, discriminator_Z, batch_input_ids_X, batch_input_ids_Y, 
+        batch_attention_mask_X, batch_attention_mask_Y, batch_styles_X, batch_styles_Y, generator_optimizer, discriminator_z_optimizer)
         
         total_gen_loss += gen_loss
         total_rec_loss += rec_loss
@@ -335,13 +333,13 @@ for epoch in range(epochs):
         num_batches += 1
         step += 1
         learning_rates.append(current_lr.numpy())
-        
+
     # 验证循环
     total_valid_loss = tf.constant(0.0, dtype=tf.float32)
     total_valid_accuracy = tf.constant(0.0, dtype=tf.float32)
     num_valid_batches = 0
-    for batch_input_ids, batch_attention_mask, batch_labels in valid_dataset_X:
-        loss, accuracy = ex.valid_step(generator, batch_input_ids, batch_attention_mask, batch_labels)
+    for batch_input_ids, batch_attention_mask, batch_labels, batch_styles in valid_dataset_X:
+        loss, accuracy = ex.valid_step(generator, batch_input_ids, batch_attention_mask, batch_labels, batch_styles)
         total_valid_loss += loss
         total_valid_accuracy += accuracy
         num_valid_batches += 1
@@ -383,7 +381,8 @@ text_input_ids, test_attention_mask, test_labels = ex.prepare_input_data(test_da
 test_dataset=tf.data.Dataset.from_tensor_slices((
     tf.cast(text_input_ids, tf.int32),
     tf.cast(test_attention_mask, tf.int32),
-    tf.cast(test_labels, tf.int32)
+    tf.cast(test_labels, tf.int32),
+    tf.cast(test_styles, tf.int32)
 )).batch(batch_size)
 ex.test_evalution(ex.test_step,test_dataset)
 
@@ -399,11 +398,9 @@ ex.plot_losses(rec_losses, lm_losses, adv_losses, kl_losses, disc_losses, disc_z
 
 # 保存模型和分词器
 generator.save_pretrained('./model/generator')
-# discriminator_X.save_pretrained('./model/discriminator_X')
 discriminator_Y.save_pretrained('./model/discriminator_Y')
 discriminator_Z.save('./model/discriminator_Z')
 tokenizer.save_pretrained('./model/tokenizer')
-tokenizer_Z.save_pretrained('./model/tokenizer_Z')
 
 # 生成文本
 prompts = ["我应该是听说过的。", "我想，我眼见你慢慢倒地，怎么会摔坏呢，装腔作势罢了，真是可恶。"]
