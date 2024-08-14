@@ -1,4 +1,3 @@
-from transformers import BertTokenizer, TFGPT2LMHeadModel, DataCollatorForLanguageModeling
 import tensorflow as tf
 import os
 import re
@@ -19,10 +18,11 @@ def perplexity_curve(perplexities, save_dir):
     plt.close()
 
 # 绘制损失值曲线
-def loss_curve(train_loss,valid_loss,save_dir):
+def loss_curve(train_loss, valid_loss, test_loss, save_dir):
     plt.figure(figsize=(10, 6))
     plt.plot(range(1, len(train_loss) + 1), train_loss, marker='o', label='Train Loss')
     plt.plot(range(1, len(valid_loss) + 1), valid_loss, marker='o', label='Valid Loss')
+    plt.plot(range(1, len(test_loss) + 1), test_loss, marker='o', label='Test Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.title('Loss Curve')
@@ -31,10 +31,11 @@ def loss_curve(train_loss,valid_loss,save_dir):
     plt.close()
 
 # 绘制准确率曲线
-def accuracy_curve(train_accuracy,valid_accuracy,save_dir):
+def accuracy_curve(train_accuracy, valid_accuracy, test_accuracy, save_dir):
     plt.figure(figsize=(10, 6))
     plt.plot(range(1, len(train_accuracy) + 1), train_accuracy, marker='o', label='Train Accuracy')
     plt.plot(range(1, len(valid_accuracy) + 1), valid_accuracy, marker='o', label='Valid Accuracy')
+    plt.plot(range(1, len(test_accuracy) + 1), test_accuracy, marker='o', label='Test Accuracy')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy')
     plt.title('Accuracy Curve')
@@ -92,84 +93,114 @@ def generate_text(model, tokenizer, prompt, max_length=50):
     
     return generated_text
 
-# 准备数据集
+import logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+# 读取数据集
 def load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, split_ratio=0.9, seed=None):
     if seed is not None:
         random.seed(seed)
 
-    with open(file_path_X, 'r', encoding='utf-8') as fx:
-        lines_X = fx.read().splitlines()
-    random.shuffle(lines_X)
-    split = int(len(lines_X) * split_ratio)
-    train_lines_X = [(line, 0) for line in lines_X[:split]]  # 风格 0
-    valid_lines_X = [(line, 0) for line in lines_X[split:]]
+    def read_and_tokenize(file_path, style):
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.read().splitlines()
+        random.shuffle(lines)
+        split = int(len(lines) * split_ratio)
+        train_lines = lines[:split]
+        valid_lines = lines[split:]
+        
+        train_encoded = tokenizer(train_lines, truncation=True, padding=False)
+        valid_encoded = tokenizer(valid_lines, truncation=True, padding=False)
 
-    with open(file_path_Y, 'r', encoding='utf-8') as fy:
-        lines_Y = fy.read().splitlines()
-    random.shuffle(lines_Y)
-    split = int(len(lines_Y) * split_ratio)
-    train_lines_Y = [(line, 1) for line in lines_Y[:split]]  # 风格 1
-    valid_lines_Y = [(line, 1) for line in lines_Y[split:]]
+        train_dataset = (
+            train_encoded['input_ids'],
+            train_encoded['attention_mask'],
+            [style] * len(train_lines)
+        )
+        valid_dataset = (
+            valid_encoded['input_ids'],
+            valid_encoded['attention_mask'],
+            [style] * len(valid_lines)
+        )
+        
+        return train_dataset, valid_dataset
+
+    train_dataset_X, valid_dataset_X = read_and_tokenize(file_path_X, 0)
+    train_dataset_Y, valid_dataset_Y = read_and_tokenize(file_path_Y, 1)
 
     with open(test_file_path, 'r', encoding='utf-8') as f_test:
         test_lines = f_test.read().splitlines()
-    test_dataset = tokenizer(test_lines, return_tensors='tf', truncation=True, padding=True, pad_to_multiple_of=8)
+    test_encoded = tokenizer(test_lines, truncation=True, padding=False)
+    test_dataset = (
+        test_encoded['input_ids'], 
+        test_encoded['attention_mask'], 
+        [0] * len(test_lines)
+    )
 
-    train_dataset_X = tokenizer([line for line, _ in train_lines_X], return_tensors='tf', truncation=True, padding=True, pad_to_multiple_of=8)
-    valid_dataset_X = tokenizer([line for line, _ in valid_lines_X], return_tensors='tf', truncation=True, padding=True, pad_to_multiple_of=8)
-    train_dataset_Y = tokenizer([line for line, _ in train_lines_Y], return_tensors='tf', truncation=True, padding=True, pad_to_multiple_of=8)
-    valid_dataset_Y = tokenizer([line for line, _ in valid_lines_Y], return_tensors='tf', truncation=True, padding=True, pad_to_multiple_of=8)
+    return (train_dataset_X, train_dataset_Y, valid_dataset_X, valid_dataset_Y, test_dataset)
 
-    train_styles_X = tf.constant([style for _, style in train_lines_X], dtype=tf.int32)
-    valid_styles_X = tf.constant([style for _, style in valid_lines_X], dtype=tf.int32)
-    train_styles_Y = tf.constant([style for _, style in train_lines_Y], dtype=tf.int32)
-    valid_styles_Y = tf.constant([style for _, style in valid_lines_Y], dtype=tf.int32)
-
-    return (train_dataset_X, train_styles_X), (train_dataset_Y, train_styles_Y), (
-        valid_dataset_X, valid_styles_X), (valid_dataset_Y, valid_styles_Y), test_dataset
-
-
-# 教师强制
-def prepare_input_data(dataset, styles):
-    input_ids = dataset['input_ids']
-    attention_mask = dataset['attention_mask']
+def create_labels(input_ids, attention_mask):
+    max_len = max(len(seq) for seq in input_ids)
+    # 确保 input_ids 和 attention_mask 是 Python 列表
+    input_ids = tf.keras.preprocessing.sequence.pad_sequences(input_ids, maxlen=max_len, padding='post')
+    attention_mask = tf.keras.preprocessing.sequence.pad_sequences(attention_mask, maxlen=max_len, padding='post')
+    
     labels = tf.roll(input_ids, shift=-1, axis=1)
-    labels = tf.where(attention_mask == 0, -100, labels)  # 使用-100来忽略填充标记
-    return input_ids, attention_mask, labels, styles
+    labels = tf.where(attention_mask == 0, -100, labels)
+    return labels
+
+# 创建数据集
+def create_tf_dataset(dataset, batch_size, drop_remainder=True):
+    input_ids, attention_mask, styles = dataset
+    
+    def gen():
+        for i in range(len(input_ids)):
+            yield {'input_ids': input_ids[i], 
+                   'attention_mask': attention_mask[i], 
+                   'style': styles[i]}
+    
+    tf_dataset = tf.data.Dataset.from_generator(
+        gen,
+        output_signature={
+            'input_ids': tf.TensorSpec(shape=(None,), dtype=tf.int32),
+            'attention_mask': tf.TensorSpec(shape=(None,), dtype=tf.int32),
+            'style': tf.TensorSpec(shape=(), dtype=tf.int32)
+        }
+    )
+    
+    padded_shapes = {
+        'input_ids': tf.TensorShape([None]),
+        'attention_mask': tf.TensorShape([None]),
+        'style': tf.TensorShape([])
+    }
+    
+    tf_dataset = tf_dataset.padded_batch(batch_size, padded_shapes=padded_shapes, drop_remainder=drop_remainder)
+    
+    return tf_dataset
 
 # 测试集评估函数
-def test_evalution(test_step,dataset):
-    total_test_loss=tf.constant(0.0,dtype=tf.float32)
-    total_test_accuracy=tf.constant(0.0,dtype=tf.float32)
-    num_test_batches=0
-    for batch_input_ids,batch_attention_mask,batch_labels in dataset:
-        loss,accuracy=test_step(batch_input_ids,batch_attention_mask,batch_labels)
-        total_test_loss+=loss
-        total_test_accuracy+=accuracy
-        num_test_batches+=1
-    avg_test_loss=total_test_loss/tf.cast(num_test_batches,tf.float32)
-    avg_test_accuracy=total_test_accuracy/tf.cast(num_test_batches,tf.float32)
-    test_perplexity=tf.exp(avg_test_loss).numpy()
+def test_evalution(generator, test_step,dataset):
+    test_perplexity = 0.0
+    total_test_loss = tf.constant(0.0,dtype=tf.float32)
+    total_test_accuracy = tf.constant(0.0,dtype=tf.float32)
+    num_test_batches = 0
+    for batch_test_X in dataset:
+        batch_input_ids = batch_test_X['input_ids']
+        batch_attention_mask = batch_test_X['attention_mask']
+        batch_labels = create_labels(batch_input_ids, batch_attention_mask)
+        styles=batch_test_X['style']
+        batch_attention_mask = tf.convert_to_tensor(batch_attention_mask, tf.int32)
+        loss,accuracy = test_step(generator, batch_input_ids, batch_attention_mask, batch_labels, styles)
+        total_test_loss += loss
+        total_test_accuracy += accuracy
+        num_test_batches += 1
+    avg_test_loss = total_test_loss / tf.cast(num_test_batches, tf.float32)
+    avg_test_accuracy = total_test_accuracy / tf.cast(num_test_batches, tf.float32)
+    test_perplexity = tf.exp(avg_test_loss).numpy()
     print(f"Test Loss: {avg_test_loss}, Test Accuracy: {avg_test_accuracy}")
     print(f"Test Perplexity: {test_perplexity}")
-
-# KL散度正则化
-def kl_divergence(p, q):
-    return tf.reduce_sum(p * tf.math.log(p / q))
-
-import tensorflow as tf
-from transformers import TFBertModel, BertTokenizer
-
-# 初始化编码器模型和分词器
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-encoder_model = TFBertModel.from_pretrained('bert-base-uncased')
-
-# 定义计算内容分布的函数
-def compute_distribution(input_ids):
-    outputs = encoder_model(input_ids)
-    hidden_states = outputs.last_hidden_state
-    content_vector = tf.reduce_mean(hidden_states, axis=1)
-    return content_vector
+    return avg_test_accuracy,avg_test_loss,test_perplexity
 
 # 绘制生成器鉴别器的各个损失
 def plot_losses(rec_losses, lm_losses, adv_losses, kl_losses, disc_losses, disc_z_losses, save_dir):
@@ -187,3 +218,55 @@ def plot_losses(rec_losses, lm_losses, adv_losses, kl_losses, disc_losses, disc_
     plt.grid(True)
     plt.savefig(os.path.join(save_dir, 'losses.png'))
     plt.close()
+
+# 验证和测试步骤
+@tf.function
+def valid_step(generator, input_ids, attention_mask, labels, styles):
+    input_ids = tf.convert_to_tensor(input_ids, dtype=tf.int32)
+    attention_mask = tf.convert_to_tensor(attention_mask, dtype=tf.int32)
+    labels = tf.convert_to_tensor(labels, dtype=tf.int32)
+    styles = tf.convert_to_tensor(styles, dtype=tf.int32)
+
+    outputs = generator(input_ids=input_ids, attention_mask=attention_mask, training=False)
+    logits = outputs.logits
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
+    mask = tf.cast(labels != -100, tf.float32)
+    loss = loss_fn(tf.where(labels == -100, 0, labels), logits)
+    loss = tf.reduce_sum(tf.cast(loss, tf.float32) * mask) / tf.reduce_sum(mask)
+    predictions=tf.argmax(logits, axis=-1)
+    predictions=tf.cast(predictions,tf.int32)
+    accuracy=tf.reduce_sum(tf.cast(tf.equal(predictions,labels),tf.float32)*mask)/tf.reduce_sum(mask)
+    return tf.cast(loss, tf.float32),accuracy
+
+@tf.function
+def test_step(generator, input_ids, attention_mask, labels, styles):
+    input_ids = tf.convert_to_tensor(input_ids, dtype=tf.int32)
+    attention_mask = tf.convert_to_tensor(attention_mask, dtype=tf.int32)
+    labels = tf.convert_to_tensor(labels, dtype=tf.int32)
+    styles = tf.convert_to_tensor(styles, dtype=tf.int32)
+
+    outputs = generator(input_ids=input_ids, attention_mask=attention_mask, training=False)
+    logits = outputs.logits
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
+    mask = tf.cast(labels != -100, tf.float32)
+    loss = loss_fn(tf.where(labels == -100, 0, labels), logits)
+    loss = tf.reduce_sum(tf.cast(loss, tf.float32) * mask) / tf.reduce_sum(mask)
+    predictions = tf.argmax(logits, axis=-1)
+    predictions = tf.cast(predictions, tf.int32)
+    accuracy = tf.reduce_sum(tf.cast(tf.equal(predictions, labels), tf.float32) * mask) / tf.reduce_sum(mask)
+    return tf.cast(loss, tf.float32), accuracy
+
+# 模型初始化时创建层
+class MyModel(tf.keras.Model):
+    def __init__(self, generator):
+        super(MyModel, self).__init__()
+        self.generator = generator
+        self.style_embeddings_layer = tf.keras.layers.Embedding(input_dim=2, output_dim=generator.config.n_embd)
+    def call(self, styles, *args, **kwargs):
+        style_embeddings = self.style_embeddings_layer(styles)
+        return style_embeddings
+    
+# 数据集读取
+def create_dataset(input_ids, attention_mask, labels, styles, batch_size):
+    dataset = tf.data.Dataset.from_tensor_slices((input_ids, attention_mask, labels, styles))
+    return dataset.shuffle(buffer_size=10000).batch(batch_size, drop_remainder=True)
