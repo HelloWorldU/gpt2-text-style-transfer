@@ -56,30 +56,9 @@ test_file_path = os.path.join(current_dir, './corpus/test_corpus.txt')
 debug_file_path = os.path.join(current_dir, './experiment/debug.txt')
 
 # 加载数据集
-train_dataset_X, train_dataset_Y, valid_dataset_X, valid_dataset_Y, test_dataset = ex.load_dataset(file_path_X, file_path_Y, 
-                                                                                                    test_file_path, tokenizer, seed=42)
+train_dataset_X, train_dataset_Y, valid_dataset_X, valid_dataset_Y, \
+test_dataset = ex.load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, seed=42)
 
-# 使用自定义学习率调度器
-initial_learning_rate = 1e-5
-warmup_steps = 8 # 5%
-decay_steps = 152
-end_learning_rate = 1e-6
-
-# Decay schedule
-lr_schedule = tf.keras.optimizers.schedules.PolynomialDecay(
-    initial_learning_rate=initial_learning_rate,
-    decay_steps=decay_steps,
-    end_learning_rate=end_learning_rate,
-    power=1.0
-)
-
-final_lr_schedule = ex.WarmUpDecay(
-    initial_learning_rate=initial_learning_rate,
-    decay_schedule_fn=lr_schedule,
-    warmup_steps=warmup_steps
-)
-
-generator_optimizer = tf.keras.optimizers.Adam(learning_rate=final_lr_schedule)
 accumulated_gradients = None
 
 mymodel = ex.MyModel(generator)
@@ -87,7 +66,7 @@ mymodel = ex.MyModel(generator)
 # 自定义生成器训练步骤
 # Only X->Y
 @tf.function
-def train_generator_step(gen, gen_optimizer, dis_Y, dis_Z, input_ids, attention_mask, labels, styles, max_len, step, 
+def train_generator_step(gen, gen_optimizer, dis_Y, dis_Z, input_ids, attention_mask, labels, styles, max_len, step, final_lr_schedule,
                          accumulation_steps=4, lambda_rec=1.0, lambda_lm=1.0, lambda_adv=1.0, lambda_kl=1.0, gamma=1.0): 
     global accumulated_gradients
     def step_fn(input_ids=input_ids, attention_mask=attention_mask, labels=labels, styles=styles, max_len=max_len):
@@ -338,11 +317,11 @@ def reinforce_step(input_ids, attention_mask, labels, style_ids, max_len, gen, l
 trainconfig = ex.Trainconfig()
 
 # 创建输入数据
-train_tf_dataset_X = ex.create_tf_dataset(train_dataset_X, batch_size)
-train_tf_dataset_Y = ex.create_tf_dataset(train_dataset_Y, batch_size)
-valid_tf_dataset_X = ex.create_tf_dataset(valid_dataset_X, batch_size)
-valid_tf_dataset_Y = ex.create_tf_dataset(valid_dataset_Y, batch_size)
-test_tf_dataset = ex.create_tf_dataset(test_dataset, batch_size)
+train_tf_dataset_X = ex.create_tf_dataset(train_dataset_X, trainconfig.batch_size)
+train_tf_dataset_Y = ex.create_tf_dataset(train_dataset_Y, trainconfig.batch_size)
+valid_tf_dataset_X = ex.create_tf_dataset(valid_dataset_X, trainconfig.batch_size)
+valid_tf_dataset_Y = ex.create_tf_dataset(valid_dataset_Y, trainconfig.batch_size)
+test_tf_dataset = ex.create_tf_dataset(test_dataset, trainconfig.batch_size)
 
 
 # 训练
@@ -352,7 +331,9 @@ class Train(tf.keras.Model):
         self.gen = gen
         self.dis_Y = dis_Y
         self.dis_Z = dis_Z
-        self.config = config
+        self.cfg = config
+        self.setup_optimizers()
+        self.setup_metrics()
 
     def setup_optimizers(self):
         """
@@ -370,24 +351,35 @@ class Train(tf.keras.Model):
             power=1.0
         )
 
-        final_lr_schedule = ex.WarmUpDecay(
+        self.final_lr_schedule = ex.WarmUpDecay(
             initial_learning_rate=initial_learning_rate,
             decay_schedule_fn=lr_schedule,
             warmup_steps=warmup_steps
         )
 
-        self.gen_optimizer = tf.keras.optimizers.Adam(learning_rate=final_lr_schedule)
+        self.gen_optimizer = tf.keras.optimizers.Adam(learning_rate=self.final_lr_schedule)
         self.dis_Y_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
         self.dis_Z_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
 
     def setup_metrics(self):
-        self.train_loss = tf.keras.metrics.Mean(name='train_loss')
-        self.train_accuracy = tf.keras.metrics.Mean(name='train_accuracy')
-        self.valid_loss = tf.keras.metrics.Mean(name='valid_loss')
-        self.valid_accuracy = tf.keras.metrics.Mean(name='valid_accuracy')
+        metric_names = ['train_loss', 'train_accuracy', 'rec_loss', 'lm_loss', 'adv_loss', 
+                        'kl_loss', 'disc_y_loss', 'disc_z_loss', 'reinforce_loss', 
+                        'valid_loss', 'valid_accuracy', 'learning_rate', 'perplexity']
+        self.metrics = {name: tf.keras.metrics.Mean(name=name) for name in metric_names}
+
+    def update_metrics(self, **kwargs) -> dict:
+        for name, value in kwargs.items():
+            if name in self.metrics:
+                self.metrics[name].update_state(value)
+
+    def reset_metrics(self):
+        for metric in self.metrics.value():
+            metric.reset_states()
 
     def train(self, train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, epochs, *args, **kwargs):
         for epoch in range(epochs):
+            self.reset_metrics()
+
             for batch_X, batch_Y in zip(train_tf_dataset_X, train_tf_dataset_Y):
                 print(f"Train Epoch {epoch + 1} started")
 
@@ -416,26 +408,41 @@ class Train(tf.keras.Model):
                 print("batch_attention_mask_Y.shape:", batch_attention_mask_Y.shape)
 
                 print("Training gen")
-                gen_loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, 
-                accuracy = train_generator_step(self.gen, self.dis_Y, 
-                            batch_input_ids_X, batch_attention_mask_X, 
-                            batch_labels_X, batch_styles_X, max_len, 
-                            tf.cast(lr_step, tf.float32), accumulation_steps, 
-                            lambda_rec, lambda_lm, lambda_adv, lambda_kl, gamma)
+                loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr \
+                , accuracy = train_generator_step(self.gen, self.gen_optimizer, 
+                            self.dis_Y, self.dis_Z, batch_input_ids_X, 
+                            batch_attention_mask_X, batch_labels_X, 
+                            batch_styles_X, max_len, tf.cast(self.cfg.lr_step, tf.float32), 
+                            self.final_lr_schdule, self.cfg.accumulation_steps,
+                            self.cfg.lambda_rec, self.cfg.lambda_lm, 
+                            self.cfg.lambda_adv, self.cfg.lambda_kl, 
+                            self.cfg.gamma)
                 
                 print("Training REINFORCE")
-                reinforce_loss = reinforce_step(batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X, max_len, self.gen, 
-                                                                                    self.dis_Y, self.gen_optimizer)
+                reinforce_loss = reinforce_step(batch_input_ids_X, 
+                                batch_attention_mask_X, batch_labels_X, 
+                                batch_styles_X, max_len, self.gen, 
+                                self.dis_Y, self.gen_optimizer)
 
                 generated_ids_Y = self.gen.generate(batch_input_ids_X, attention_mask=batch_attention_mask_X, max_length=max_len)
 
                 print("Training discriminator Y")
-                disc_loss_Y, real_loss_Y, fake_loss_Y = train_discriminator_Y_step(batch_input_ids_Y, batch_attention_mask_Y, generated_ids_Y, self.dis_Y, self.dis_Y_optimizer)
+                disc_loss_Y, real_loss_Y \
+                , fake_loss_Y = train_discriminator_Y_step(batch_input_ids_Y, 
+                                batch_attention_mask_Y, generated_ids_Y, 
+                                self.dis_Y, self.dis_Y_optimizer, self.cfg.gamma)
                 
                 print("Training discriminator Z")
-                disc_z_loss_X, disc_z_loss_Y = train_generator_with_discriminator_Z(self.gen, self.dis_Z, batch_input_ids_X, batch_input_ids_Y, batch_attention_mask_X, batch_attention_mask_Y, batch_styles_X, batch_styles_Y, max_len, self.gen_optimizer, self.dis_z_optimizer, label_smoothing)
+                disc_z_loss_X, disc_z_loss_Y = train_generator_with_discriminator_Z(
+                                self.gen, self.dis_Z, batch_input_ids_X, 
+                                batch_input_ids_Y, batch_attention_mask_X, 
+                                batch_attention_mask_Y, batch_styles_X, 
+                                batch_styles_Y, max_len, self.gen_optimizer, 
+                                self.dis_z_optimizer, self.cfg.label_smoothing)
+                
+                self.cfg.lr_step += 1
+                self.num_batches += 1
                 print(f"Train Epoch {epoch + 1} completed")
-
 
             print(f"Valid Epoch {epoch + 1} started")
             for batch_valid_X in valid_tf_dataset_X:
@@ -445,157 +452,78 @@ class Train(tf.keras.Model):
                 batch_valid_styles = batch_valid_X['style']
 
                 batch_valid_attention_mask = tf.convert_to_tensor(batch_valid_attention_mask, dtype=tf.int32)
-                loss, accuracy = ex.valid_step(self.gen, batch_valid_ids, batch_valid_attention_mask, batch_valid_labels, batch_valid_styles)
-                total_valid_loss += loss
-                total_valid_accuracy += accuracy
+                valid_loss, valid_accuracy = ex.valid_step(self.gen, 
+                                    batch_valid_ids, batch_valid_attention_mask, 
+                                    batch_valid_labels, batch_valid_styles)
+                self.total_valid_loss += loss
+                self.total_valid_accuracy += accuracy
                 num_valid_batches += 1
+
+                self.update_metrics(loss, accuracy, rec_loss, lm_loss, adv_loss, kl_loss,
+                            disc_loss_Y, (disc_z_loss_X + disc_z_loss_Y) / 2.0,
+                            reinforce_loss, valid_loss, valid_accuracy, current_lr)
+            
+            self.print_epoch_results()
             print(f"Valid Epoch {epoch + 1} completed")
 
+        self.metrics['valid_perplexity'] = tf.exp(self.metrics['valid_loss'].result())
+        self.append_to_config()
 
-# 训练循环
-lr_step = 0
-for epoch in range(epochs):
-    print(f"Epoch {epoch + 1} started")
+    def append_to_config(self):
+        self.cfg.train_losses.append(self.metrics['train_loss'].result().numpy())
+        self.cfg.train_accuracies.append(self.metrics['train_accuracy'].result().numpy())
+        self.cfg.rec_losses.append(self.metrics['rec_loss'].result().numpy())
+        self.cfg.lm_losses.append(self.metrics['lm_loss'].result().numpy())
+        self.cfg.adv_losses.append(self.metrics['adv_loss'].result().numpy())
+        self.cfg.kl_losses.append(self.metrics['kl_loss'].result().numpy())
+        self.cfg.disc_losses.append(self.metrics['disc_y_loss'].result().numpy())
+        self.cfg.disc_z_losses.append(self.metrics['disc_z_loss'].result().numpy())
+        self.cfg.reinforce_losses.append(self.metrics['reinforce_loss'].result().numpy())
+        self.cfg.valid_losses.append(self.metrics['valid_loss'].result().numpy())
+        self.cfg.valid_accuracies.append(self.metrics['valid_accuracy'].result().numpy())
+        self.cfg.perplexities.append(self.metrics['valid_perplexity'].result().numpy())
+        self.cfg.learning_rates.append(self.metrics['current_lr'].result().numpy())
 
-    total_gen_loss = tf.constant(0.0, dtype=tf.float32)
-    total_rec_loss = tf.constant(0.0, dtype=tf.float32)
-    total_lm_loss = tf.constant(0.0, dtype=tf.float32)
-    total_adv_loss = tf.constant(0.0, dtype=tf.float32)
-    total_kl_loss = tf.constant(0.0, dtype=tf.float32)
-    total_disc_loss = tf.constant(0.0, dtype=tf.float32)
-    total_disc_z_loss = tf.constant(0.0, dtype=tf.float32)
-    total_accuracy = tf.constant(0.0, dtype=tf.float32)
-    total_reinforce_loss = tf.constant(0.0, dtype=tf.float32)
-    num_batches = 0
+    def print_epoch_results(self):
+        template_key = {name for name in self.metrics.keys()}
+        template_value = {metric.result().numpy() for metric in self.metrics.values()}
+        template = ''.join([f"{key}: {value} "for key, value in zip(template_key, template_value)])
+        for _, result in enumerate(template):
+            print(result)
 
-    # 生成器鉴别器交替训练
-    for batch_X, batch_Y in zip(train_tf_dataset_X, train_tf_dataset_Y):
-        # 对于 X 数据
-        batch_input_ids_X = batch_X['input_ids']
-        batch_attention_mask_X = batch_X['attention_mask']
-        batch_labels_X = ex.create_labels(batch_input_ids_X, batch_attention_mask_X)
-        batch_styles_X = batch_X['style']
+# 实例化并训练
+train_model = Train(generator, discriminator_Y, discriminator_Z, trainconfig)
 
-        # 对于 Y 数据
-        batch_input_ids_Y = batch_Y['input_ids']
-        batch_attention_mask_Y = batch_Y['attention_mask']
-        batch_labels_Y = ex.create_labels(batch_input_ids_Y, batch_attention_mask_Y)
-        batch_styles_Y = batch_Y['style']
-        print("Processing batch")
-        # print("batch_labels_X:", batch_labels_X)
+import json
 
-        # 动态 Padding
-        max_len_X, batch_input_ids_X, batch_attention_mask_X = dis.dynamic_padding(batch_input_ids_X, batch_attention_mask_X)
-        max_len_Y, batch_input_ids_Y, batch_attention_mask_Y = dis.dynamic_padding(batch_input_ids_Y, batch_attention_mask_Y)
-        max_len = max(max_len_X, max_len_Y) + 101
-        
-        batch_attention_mask_X = tf.convert_to_tensor(batch_attention_mask_X, dtype=tf.int32)
-        batch_attention_mask_Y = tf.convert_to_tensor(batch_attention_mask_Y, dtype=tf.int32)
+os.environ['TF_CONFIG'] = json.dumps({
+    'cluster': {
+        "chief": ["host1:2222"],
+        "worker": ["host2:2222", "host3:2222", "host4:2222"]
+    },
+    "task": {"type": "worker", "index": 1}
+})
 
-        print("batch_input_ids_X shape:", batch_input_ids_X.shape)
-        print("batch_attention_mask_X shape:", batch_attention_mask_X.shape)
-        print("batch_input_ids_Y shape:", batch_input_ids_Y.shape)
-        print("batch_attention_mask_Y.shape:", batch_attention_mask_Y.shape)
-
-        # 生成器
-        print("Training gen")
-        gen_loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy = train_gen_step(gen, dis_Y, 
-                                                                                batch_input_ids_X, batch_attention_mask_X, batch_labels_X, 
-                                                                                batch_styles_X, max_len, tf.cast(lr_step, tf.float32), 
-                                                                                accumulation_steps, lambda_rec, lambda_lm, lambda_adv, 
-                                                                                lambda_kl, gamma)
-        print("Training REINFORCE")
-        reinforce_loss = reinforce_step(batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X, max_len, gen, 
-                                                                            dis_Y, gen_optimizer)
-
-        # 鉴别器
-        generated_ids_Y = gen.generate(batch_input_ids_X, attention_mask=batch_attention_mask_X, max_length=max_len)
-        print("Training discriminator Y")
-        disc_loss_Y, real_loss_Y, fake_loss_Y = train_dis_Y_step(batch_input_ids_Y, batch_attention_mask_Y, generated_ids_Y, 
-                                                                           dis_Y, dis_Y_optimizer)
-        print("Training discriminator Z")
-        disc_z_loss_X, disc_z_loss_Y = train_gen_with_discriminator_z(gen, discriminator_Z, batch_input_ids_X, batch_input_ids_Y, 
-                                                                            batch_attention_mask_X, batch_attention_mask_Y, 
-                                                                            batch_styles_X, batch_styles_Y, max_len, gen_optimizer, 
-                                                                            dis_Z_optimizer, label_smoothing)
-        print("Epoch completed")
-        
-    total_gen_loss += tf.cast(gen_loss, tf.float32)
-    print("gen loss: ", gen_loss)
-    total_rec_loss += tf.cast(rec_loss, tf.float32)
-    total_lm_loss += tf.cast(lm_loss, tf.float32)
-    total_adv_loss += tf.cast(adv_loss, tf.float32)
-    total_kl_loss += tf.cast(kl_loss, tf.float32)
-    total_disc_loss += tf.cast(disc_loss_Y, tf.float32)
-    total_disc_z_loss += tf.cast((disc_z_loss_X + disc_z_loss_Y) / 2, tf.float32)
-    total_accuracy += tf.cast(accuracy, tf.float32)
-    total_reinforce_loss += tf.cast(reinforce_loss, tf.float32)
-    num_batches += 1
-    lr_step += 1
-    learning_rates.append(current_lr.numpy())
-
-    # 验证循环
-    total_valid_loss = tf.constant(0.0, dtype=tf.float32)
-    total_valid_accuracy = tf.constant(0.0, dtype=tf.float32)
-    num_valid_batches = 0
-    for batch_valid_X in valid_tf_dataset_X:
-        batch_valid_ids = batch_valid_X['input_ids']
-        batch_valid_attention_mask = batch_valid_X['attention_mask']
-        batch_valid_labels = ex.create_labels(batch_valid_ids, batch_valid_attention_mask)
-        batch_valid_styles = batch_valid_X['style']
-
-        batch_valid_attention_mask = tf.convert_to_tensor(batch_valid_attention_mask, dtype=tf.int32)
-        loss, accuracy = ex.valid_step(gen, batch_valid_ids, batch_valid_attention_mask, batch_valid_labels, batch_valid_styles)
-        total_valid_loss += loss
-        total_valid_accuracy += accuracy
-        num_valid_batches += 1
-    avg_train_loss = total_gen_loss / tf.cast(num_batches, tf.float32)
-    avg_rec_loss = total_rec_loss / tf.cast(num_batches, tf.float32)
-    avg_lm_loss = total_lm_loss / tf.cast(num_batches, tf.float32)
-    avg_adv_loss = total_adv_loss / tf.cast(num_batches, tf.float32)
-    avg_kl_loss = total_kl_loss / tf.cast(num_batches, tf.float32)
-    avg_disc_loss = total_disc_loss / tf.cast(num_batches, tf.float32)
-    avg_disc_z_loss = total_disc_z_loss / tf.cast(num_batches, tf.float32)
-    avg_train_accuracy = total_accuracy / tf.cast(num_batches, tf.float32)
-    avg_reinforce_loss = total_reinforce_loss / tf.cast(num_batches, tf.float32)
-    avg_valid_loss = total_valid_loss / tf.cast(num_valid_batches, tf.float32)
-    avg_valid_accuracy = total_valid_accuracy / tf.cast(num_valid_batches, tf.float32)
-    train_losses.append(avg_train_loss.numpy())
-    rec_losses.append(avg_rec_loss.numpy())
-    lm_losses.append(avg_lm_loss.numpy())
-    adv_losses.append(avg_adv_loss.numpy())
-    kl_losses.append(avg_kl_loss.numpy())
-    disc_losses.append(avg_disc_loss.numpy())
-    disc_z_losses.append(avg_disc_z_loss.numpy())
-    train_accuracies.append(avg_train_accuracy.numpy())
-    valid_losses.append(avg_valid_loss.numpy())
-    valid_accuracies.append(avg_valid_accuracy.numpy())
-    train_perplexity = tf.exp(avg_train_loss).numpy()
-    valid_perplexity = tf.exp(avg_valid_loss).numpy()
-    perplexities.append(valid_perplexity)
-    print(f"Epoch {epoch + 1} ended")
-    print(f"Train Loss: {avg_train_loss:.4f}, Valid Loss: {avg_valid_loss:.4f}")
-    print(f"Train Accuracy: {avg_train_accuracy:.4f}, Valid Accuracy: {avg_valid_accuracy:.4f}")
-    print(f"Train Perplexity: {train_perplexity:.4f}, Valid Perplexity: {valid_perplexity:.4f}")
-    print(f"Discriminator Loss: {avg_disc_loss:.4f}")
-    print(f"REINFORCE Loss: {avg_reinforce_loss:.4f}")
-    print("---")
+mirrored_strategy = tf.distribute.MirroredStrategy()
+with mirrored_strategy.scope():
+    train_model.train(train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, trainconfig.epochs)
 
 # 测试集评估
-test_accuracies, test_losses, test_perplexity = ex.test_evalution(gen, ex.test_step,test_tf_dataset)
+test_accuracies, test_losses, test_perplexity = ex.test_evalution(generator, ex.test_step,test_tf_dataset)
 
 # 保存绘图
 save_dir = './experiment'
 if not os.path.exists(save_dir):
     os.makedirs(save_dir)
-ex.perplexity_curve(perplexities, save_dir)
-ex.loss_curve(train_losses, valid_losses, save_dir)
-ex.accuracy_curve(train_accuracies, valid_accuracies, save_dir)
-ex.learning_rate_curve(learning_rates, save_dir)
-ex.plot_losses(rec_losses, lm_losses, adv_losses, kl_losses, disc_losses, disc_z_losses, save_dir)
+ex.perplexity_curve(train_model.cfg.perplexities, save_dir)
+ex.loss_curve(train_model.cfg.train_losses, train_model.cfg.valid_losses, save_dir)
+ex.accuracy_curve(train_model.cfg.train_accuracies, train_model.cfg.valid_accuracies, save_dir)
+ex.learning_rate_curve(train_model.cfg.learning_rates, save_dir)
+ex.plot_losses(train_model.cfg.rec_losses, train_model.cfg.lm_losses, train_model.cfg.adv_losses,
+                train_model.cfg.kl_losses, train_model.cfg.disc_losses, train_model.cfg.disc_z_losses, save_dir)
 
 # 保存模型和分词器
-gen.save_pretrained('./model/gen')
+generator.save_pretrained('./model/generator')
 discriminator_Y.save_pretrained('./model/discriminator_Y')
 discriminator_Z.save_weights('./model/discriminator_Z/discriminator_Z_weights')
 tokenizer.save_pretrained('./model/tokenizer')
@@ -604,5 +532,5 @@ tokenizer.save_pretrained('./model/tokenizer')
 prompts = ["我应该是听说过的。", "我想，我眼见你慢慢倒地，怎么会摔坏呢，装腔作势罢了，真是可恶。"]
 with open('./corpus/generated.txt', 'w', encoding='utf-8') as f:
     for prompt in prompts:
-        generated_text = ex.generate_text(gen, tokenizer, prompt)
+        generated_text = ex.generate_text(generator, tokenizer, prompt)
         f.write(generated_text + "\n")
