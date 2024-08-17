@@ -44,8 +44,8 @@ def kl_divergence(zx_distribution, zy_distribution):
     return tf.clip_by_value(kl_loss, -1e3, 1e3)
 
 # 定义计算内容分布的函数
-def compute_distribution(input_ids, discriminator_Z):
-    outputs = discriminator_Z(input_ids)
+def compute_distribution(input_ids, dis_Z):
+    outputs = dis_Z(input_ids)
     content_vector = tf.reduce_mean(outputs, axis=1)
     return content_vector
 
@@ -89,14 +89,14 @@ def convert_to_tensor(input_ids, attention_mask, labels, styles):
     return input_ids, attention_mask, labels, styles
 
 # 显示生成id
-def generate_with_float32(generator, input_ids, attention_mask, **kwargs):
+def generate_with_float32(gen, input_ids, attention_mask, **kwargs):
     input_ids = tf.cast(input_ids, tf.int32)
     attention_mask = tf.cast(attention_mask, tf.int32)
     # Use the new mixed precision policy
     original_policy = tf.keras.mixed_precision.global_policy()
     tf.keras.mixed_precision.set_global_policy('float32')
     try:
-        generated_ids = generator.generate(input_ids, attention_mask=attention_mask, **kwargs)
+        generated_ids = gen.generate(input_ids, attention_mask=attention_mask, **kwargs)
         generated_ids = tf.cast(generated_ids, tf.float32)
     finally:
         # Restore the original policy
