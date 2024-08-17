@@ -314,7 +314,7 @@ def reinforce_step(input_ids, attention_mask, labels, style_ids, max_len, gen, l
     return loss
 
 # 训练参数
-trainconfig = ex.Trainconfig()
+trainconfig = pr.Trainconfig()
 
 # 创建输入数据
 train_tf_dataset_X = ex.create_tf_dataset(train_dataset_X, trainconfig.batch_size)
@@ -334,6 +334,7 @@ class Train(tf.keras.Model):
         self.cfg = config
         self.setup_optimizers()
         self.setup_metrics()
+
 
     def setup_optimizers(self):
         """
@@ -361,20 +362,24 @@ class Train(tf.keras.Model):
         self.dis_Y_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
         self.dis_Z_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
 
+
     def setup_metrics(self):
         metric_names = ['train_loss', 'train_accuracy', 'rec_loss', 'lm_loss', 'adv_loss', 
                         'kl_loss', 'disc_y_loss', 'disc_z_loss', 'reinforce_loss', 
-                        'valid_loss', 'valid_accuracy', 'learning_rate', 'perplexity']
+                        'valid_loss', 'valid_accuracy', 'perplexity', 'learning_rate']
         self.metrics = {name: tf.keras.metrics.Mean(name=name) for name in metric_names}
 
-    def update_metrics(self, **kwargs) -> dict:
-        for name, value in kwargs.items():
+
+    def update_metrics(self, **kwargs) -> None:
+        for name, value in kwargs:
             if name in self.metrics:
                 self.metrics[name].update_state(value)
 
+
     def reset_metrics(self):
-        for metric in self.metrics.value():
+        for metric in self.metrics.values():
             metric.reset_states()
+    
 
     def train(self, train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, epochs, *args, **kwargs):
         for epoch in range(epochs):
@@ -413,7 +418,7 @@ class Train(tf.keras.Model):
                             self.dis_Y, self.dis_Z, batch_input_ids_X, 
                             batch_attention_mask_X, batch_labels_X, 
                             batch_styles_X, max_len, tf.cast(self.cfg.lr_step, tf.float32), 
-                            self.final_lr_schdule, self.cfg.accumulation_steps,
+                            self.final_lr_schedule, self.cfg.accumulation_steps,
                             self.cfg.lambda_rec, self.cfg.lambda_lm, 
                             self.cfg.lambda_adv, self.cfg.lambda_kl, 
                             self.cfg.gamma)
@@ -440,8 +445,19 @@ class Train(tf.keras.Model):
                                 batch_styles_Y, max_len, self.gen_optimizer, 
                                 self.dis_z_optimizer, self.cfg.label_smoothing)
                 
+                self.update_metrics(
+                    train_loss=loss,
+                    train_accuracy=accuracy,
+                    rec_loss=rec_loss,
+                    lm_loss=lm_loss,
+                    adv_loss=adv_loss,
+                    kl_loss=kl_loss,
+                    disc_y_loss=disc_loss_Y,
+                    disc_z_loss=(disc_z_loss_X + disc_z_loss_Y) / 2.0,
+                    reinforce_loss=reinforce_loss,
+                    learning_rate=current_lr
+                )
                 self.cfg.lr_step += 1
-                self.num_batches += 1
                 print(f"Train Epoch {epoch + 1} completed")
 
             print(f"Valid Epoch {epoch + 1} started")
@@ -455,19 +471,17 @@ class Train(tf.keras.Model):
                 valid_loss, valid_accuracy = ex.valid_step(self.gen, 
                                     batch_valid_ids, batch_valid_attention_mask, 
                                     batch_valid_labels, batch_valid_styles)
-                self.total_valid_loss += loss
-                self.total_valid_accuracy += accuracy
-                num_valid_batches += 1
 
-                self.update_metrics(loss, accuracy, rec_loss, lm_loss, adv_loss, kl_loss,
-                            disc_loss_Y, (disc_z_loss_X + disc_z_loss_Y) / 2.0,
-                            reinforce_loss, valid_loss, valid_accuracy, current_lr)
-            
+                self.update_metrics(
+                    valid_loss=valid_loss,
+                    valid_accuracy=valid_accuracy
+                )
+
+            self.metrics['valid_perplexity'] = tf.exp(self.metrics['valid_loss'].result())
             self.print_epoch_results()
+            self.append_to_config()
             print(f"Valid Epoch {epoch + 1} completed")
 
-        self.metrics['valid_perplexity'] = tf.exp(self.metrics['valid_loss'].result())
-        self.append_to_config()
 
     def append_to_config(self):
         self.cfg.train_losses.append(self.metrics['train_loss'].result().numpy())
@@ -484,12 +498,11 @@ class Train(tf.keras.Model):
         self.cfg.perplexities.append(self.metrics['valid_perplexity'].result().numpy())
         self.cfg.learning_rates.append(self.metrics['current_lr'].result().numpy())
 
+
     def print_epoch_results(self):
-        template_key = {name for name in self.metrics.keys()}
-        template_value = {metric.result().numpy() for metric in self.metrics.values()}
-        template = ''.join([f"{key}: {value} "for key, value in zip(template_key, template_value)])
-        for _, result in enumerate(template):
-            print(result)
+        template = ''.join(f"{key}: {metric.result().numpy()}" for key, metric in self.metrics.items())
+        print(template)
+
 
 # 实例化并训练
 train_model = Train(generator, discriminator_Y, discriminator_Z, trainconfig)
@@ -504,7 +517,7 @@ os.environ['TF_CONFIG'] = json.dumps({
     "task": {"type": "worker", "index": 1}
 })
 
-mirrored_strategy = tf.distribute.MirroredStrategy()
+mirrored_strategy = tf.distribute.MultiWorkerMirroredStrategy()
 with mirrored_strategy.scope():
     train_model.train(train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, trainconfig.epochs)
 
