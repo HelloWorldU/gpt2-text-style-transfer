@@ -1,18 +1,102 @@
-# gpt2-style-transfer
-Text Style Converter Based on GPT2
-Small scale experimental iteration
 
-First time: Set fixed hyperparameters, select a story, train a pre trained model, and only observe the loss value
+# LuoBiFengYu - Text Style Transfer Model
 
-Second time: Try different hyperparameters, add BLEU evaluation, use mixed precision training, use PolynomialDecay learning rate scheduler, add perplexity evaluation, expand the training set to three stories, save generated text, draw learning rate and perplexity curves
+This project is aimed at achieving text style transfer by training generator and discriminator models. The generator model is fine-tuned based on GPT-2, and the discriminator models are built using BERT and a simple feedforward neural network.
 
-Third time: Add validation and test sets, adjust each training batch
+## Project Structure
 
-Fourth time: Change the mindset. First, divide the original dataset into two styles x and y, implement style x to y conversion, add vx and vy to represent style 
-label embedding, implement discriminator y and generator, add discriminator z to align the distribution of content vector z
+```
+├── model
+│   ├── generator
+│   ├── discriminator_Y
+│   └── discriminator_Z
+├── train_model.py
+├── requirements.txt
+└── README.md
+```
 
-Fifth time: Use KL divergence regularization on the z-distribution and optimize the model expression using the top_k activation function
+- `model/` directory contains the trained model parameters.
+- `train_model.py` is the main script for model training.
+- `requirements.txt` lists the dependencies required for the project.
 
-Sixth time: Enhance the training set with data and try to generalize the model to any style of input text that can convert style into y
+## Installation
 
-Afterwards, train the entire corpus on a single block V4 for about a day and deploy the model to the front-end and back-end projects
+Make sure you have [Python 3.8](https://www.python.org/downloads/) or higher installed. It is recommended to use [conda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html) to create a virtual environment.
+
+1. Clone the project repository:
+
+   ```bash
+   git clone https://github.com/your_username/your_repository_name.git
+   cd your_repository_name
+   ```
+
+2. Create and activate the virtual environment:
+
+   ```bash
+   conda create -n gpt2-env python=3.8
+   conda activate gpt2-env
+   ```
+
+3. Install the dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+## Usage
+
+1. Train the model:
+
+   Run the following command in the project root directory to start training the model:
+
+   ```bash
+   python train_model.py
+   ```
+
+   After training, the model parameters will be saved in the `model/` directory.
+
+2. Generate text:
+
+   You can generate stylized text by invoking the generator model:
+
+   ```python
+   from transformers import GPT2Tokenizer, TFGPT2LMHeadModel
+
+   tokenizer = GPT2Tokenizer.from_pretrained('./model/generator')
+   model = TFGPT2LMHeadModel.from_pretrained('./model/generator')
+
+   input_text = "Your input text"
+   input_ids = tokenizer.encode(input_text, return_tensors='tf')
+
+   output = model.generate(input_ids)
+   generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+
+   print(generated_text)
+   ```
+
+## Mixed Precision Training
+
+This project uses mixed precision training to improve efficiency. If you encounter issues with type mismatches between `float16` and `float32`, ensure that the data types are consistent:
+
+```python
+from tensorflow.keras.mixed_precision import set_global_policy
+
+set_global_policy('mixed_float16')
+```
+
+## Dependencies
+
+- TensorFlow >= 2.8
+- transformers >= 4.43.3
+- CUDA >= 11.2
+- cuDNN >= 8.8
+
+For a detailed list of dependencies, please refer to the `requirements.txt` file.
+
+## Contributing
+
+Feel free to submit issues and feature requests! If you want to contribute code, please fork this repository, create a new branch, and submit your changes via a Pull Request.
+
+## License
+
+This project is licensed under the Apache2.0 License. See the [LICENSE](./LICENSE) file for details.
