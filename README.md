@@ -1,7 +1,6 @@
-
 # LuoBiFengYu - Text Style Transfer Model
 
-This project is aimed at achieving text style transfer by training generator and discriminator models. The generator model is fine-tuned based on GPT-2, and the discriminator models are built using BERT and a simple feedforward neural network.
+This project is aimed at achieving text style transfer by training generator and discriminator models. The generator and discriminator_Y model is fine-tuned based on GPT-2, and the discriminator_Z models are built using a simple feedforward neural network.
 
 ## Project Structure
 
@@ -86,7 +85,7 @@ set_global_policy('mixed_float16')
 
 ## Dependencies
 
-- TensorFlow >= 2.4
+- TensorFlow >= 2.8
 - transformers >= 4.43.3
 - CUDA >= 11.2
 - cuDNN >= 8.8
