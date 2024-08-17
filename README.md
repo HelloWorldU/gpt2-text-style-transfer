@@ -5,13 +5,20 @@ This project is aimed at achieving text style transfer by training generator and
 ## Project Structure
 
 ```
+MODEL
+├── __pycache__
+├── corpus
+├── experiment
+│   ├── experiment.ipynb
+│   ├── experiment.py
+│   ├── pre_progress.py
 ├── model
-│   ├── generator
-│   ├── discriminator_Y
-│   └── discriminator_Z
+├── repository
+├── sparse_autoencoder
+├── bleu_evaluation.py
+├── discriminator.py
 ├── train_model.py
-├── requirements.txt
-└── README.md
+
 ```
 
 - `model/` directory contains the trained model parameters.
