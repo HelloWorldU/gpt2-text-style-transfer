@@ -9,14 +9,14 @@ MODEL
 ├── __pycache__
 ├── corpus
 ├── experiment
-│   ├── experiment.ipynb
-│   ├── experiment.py
-│   ├── pre_progress.py
 ├── model
 ├── repository
 ├── sparse_autoencoder
 ├── bleu_evaluation.py
 ├── discriminator.py
+├── experiment.ipynb
+├── experiment.py
+├── pre_progress.py
 ├── train_model.py
 
 ```
