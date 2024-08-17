@@ -52,33 +52,33 @@ class TrainConfig:
     lambda_kl: float = 1.0
     gamma: float = 1.0
     label_smoothing: float = 0.1
-    train_losses: list = None
-    train_accuracies: list = None
-    rec_losses: list = None
-    lm_losses: list = None
-    adv_losses: list = None
-    kl_losses: list = None
-    disc_losses: list = None
-    disc_z_losses: list = None
-    reinforce_losses: list = None
-    valid_losses: list = None
-    valid_accuracies: list = None
-    perplexities: list = None
-    learning_rates: list = None
+    train_losses: list = []
+    train_accuracies: list = []
+    rec_losses: list = []
+    lm_losses: list = []
+    adv_losses: list = []
+    kl_losses: list = []
+    disc_y_losses: list = []
+    disc_z_losses: list = []
+    reinforce_losses: list = []
+    valid_losses: list = []
+    valid_accuracies: list = []
+    perplexities: list = []
+    learning_rates: list = []
     lr_step: int = 0
 
 
-# 数据并行
-mirrored_strategy = tf.distributed.MirroredStrategy()
-os.environ['TF_CONFIG'] = json.dumps({
-    'cluster': {
-        "chief": ["host1:2222"],
-        "worker": ["host2:2222", "host3:2222", "host4:2222"]
-    },
-    "task": {"type": "worker", "index": 1}
-})
+# # 数据并行
+# mirrored_strategy = tf.distribute.MirroredStrategy()
+# os.environ['TF_CONFIG'] = json.dumps({
+#     'cluster': {
+#         "chief": ["host1:2222"],
+#         "worker": ["host2:2222", "host3:2222", "host4:2222"]
+#     },
+#     "task": {"type": "worker", "index": 1}
+# })
 
-def data_parallelism(train_step, dist_inputs):
-    per_replica_losses = mirrored_strategy.run(train_step, args=(dist_inputs,))
-    return mirrored_strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
+# def data_parallelism(train_step, dist_inputs):
+#     per_replica_losses = mirrored_strategy.run(train_step, args=(dist_inputs,))
+#     return mirrored_strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
 
