@@ -86,7 +86,7 @@ set_global_policy('mixed_float16')
 
 ## Dependencies
 
-- TensorFlow >= 2.8
+- TensorFlow >= 2.4
 - transformers >= 4.43.3
 - CUDA >= 11.2
 - cuDNN >= 8.8
