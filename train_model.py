@@ -517,7 +517,8 @@ os.environ['TF_CONFIG'] = json.dumps({
     "task": {"type": "worker", "index": 1}
 })
 
-mirrored_strategy = tf.distribute.MultiWorkerMirroredStrategy()
+communication_options = tf.distribute.experimental.CommunicationOptions(implementation=tf.distribute.experimental.CommunicationImplementation.NCCL)
+mirrored_strategy = tf.distribute.MultiWorkerMirroredStrategy(communication_options=communication_options)
 with mirrored_strategy.scope():
     train_model.train(train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, trainconfig.epochs)
 
