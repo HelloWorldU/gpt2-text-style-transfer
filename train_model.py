@@ -9,6 +9,11 @@ import logging
 # 日志级别
 logging.basicConfig(level=logging.INFO)
 
+# 环境guarantee
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ.pop('TF_CONFIG', None)
+
+
 # os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices=false'
 tf.config.optimizer.set_jit(False)  # 禁用 XLA
 
@@ -23,29 +28,32 @@ from tensorflow.keras.mixed_precision import set_global_policy
 # set_global_policy('mixed_float16')
 
 # 加载预训练模型和分词器
-model_path = "./repository/"
-tokenizer = BertTokenizer.from_pretrained(model_path)
-tokenizer.padding_side = "left"
-generator = TFGPT2LMHeadModel.from_pretrained(model_path)
-discriminator_Y = TFGPT2LMHeadModel.from_pretrained(model_path)
-discriminator_Z = tf.keras.models.Sequential([
-    tf.keras.layers.Dense(256, activation='relu'),
-    tf.keras.layers.Dense(128, activation='relu'),
-    tf.keras.layers.Dense(1, activation='sigmoid')
-])
+def pre_load():
+    model_path = "./repository/"
+    tokenizer = BertTokenizer.from_pretrained(model_path)
+    tokenizer.padding_side = "left"
+    generator = TFGPT2LMHeadModel.from_pretrained(model_path)
+    discriminator_Y = TFGPT2LMHeadModel.from_pretrained(model_path)
+    discriminator_Z = tf.keras.models.Sequential([
+        tf.keras.layers.Dense(256, activation='relu'),
+        tf.keras.layers.Dense(128, activation='relu'),
+        tf.keras.layers.Dense(1, activation='sigmoid')
+    ])
 
-special_tokens_dict = {'pad_token': '[PAD]'}
-num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
+    special_tokens_dict = {'pad_token': '[PAD]'}
+    num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
 
-tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids('[PAD]')  # 通常是0
-tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids('[SEP]')  # 通常是102
-tokenizer.bos_token_id = tokenizer.convert_tokens_to_ids('[CLS]')  # 通常是101
+    tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids('[PAD]')  # 通常是0
+    tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids('[SEP]')  # 通常是102
+    tokenizer.bos_token_id = tokenizer.convert_tokens_to_ids('[CLS]')  # 通常是101
 
-generator.config.pad_token_id = tokenizer.pad_token_id
+    generator.config.pad_token_id = tokenizer.pad_token_id
 
-# 调整模型的词嵌入大小
-generator.resize_token_embeddings(len(tokenizer))
-discriminator_Y.resize_token_embeddings(len(tokenizer))
+    # 调整模型的词嵌入大小
+    generator.resize_token_embeddings(len(tokenizer))
+    discriminator_Y.resize_token_embeddings(len(tokenizer))
+
+    return generator, discriminator_Y, discriminator_Z, tokenizer
 
 # 获取当前文件路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -55,16 +63,14 @@ test_file_path = os.path.join(current_dir, './corpus/test_corpus.txt')
 
 debug_file_path = os.path.join(current_dir, './experiment/debug.txt')
 
-# 加载数据集
-train_dataset_X, train_dataset_Y, valid_dataset_X, valid_dataset_Y, \
-test_dataset = ex.load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, seed=42)
-
 accumulated_gradients = None
 
 mymodel = ex.MyModel(generator)
 
 # 自定义生成器训练步骤
-# Only X->Y
+"""
+in this task, we only trained X->Y.
+"""
 @tf.function
 def train_generator_step(gen, gen_optimizer, dis_Y, dis_Z, input_ids, attention_mask, labels, styles, max_len, step, final_lr_schedule,
                          accumulation_steps=4, lambda_rec=1.0, lambda_lm=1.0, lambda_adv=1.0, lambda_kl=1.0, gamma=1.0): 
@@ -282,56 +288,49 @@ def train_generator_with_discriminator_Z(gen, dis_Z, input_ids_X, input_ids_Y, a
     disc_z_loss_Y = train_discriminator_Y_step(dis_Z, input_ids_Y, generated_ids_Y_Z, dis_z_optimizer, label_smoothing=label_smoothing)
     return disc_z_loss_X, disc_z_loss_Y
 
-# REINFORCE算法
-@tf.function
-def reinforce_step(input_ids, attention_mask, labels, style_ids, max_len, gen, language_model, gen_optimizer):
-    with tf.GradientTape() as tape:
-        print("input_ids shape:", input_ids.shape)
-        print("attention_mask shape:", attention_mask.shape)
-        print("style_ids shape:", style_ids.shape)
-        style_ids = tf.expand_dims(style_ids, axis=1)
-        print("Fixed max_length:", max_len)
-        generated_ids = gen.generate(input_ids, attention_mask=attention_mask, max_length=max_len)
-        generated_attention_mask = tf.pad(attention_mask, [[0, 0], [0, generated_ids.shape[1] - attention_mask.shape[1]]], "CONSTANT", constant_values=1)
-        lm_loss = dis.compute_lm_loss(generated_ids, generated_attention_mask, language_model)
-        
-        outputs = gen(input_ids, attention_mask=attention_mask, labels=labels, training=False)
-        logits = outputs.logits
-        log_probs = tf.nn.log_softmax(logits, axis=-1)
-        seq_len = tf.shape(generated_ids)[1]
-        mask = tf.sequence_mask(tf.reduce_sum(tf.cast(generated_ids != gen.config.pad_token_id, tf.int32), axis=1), maxlen=seq_len)
-        log_probs_padded = tf.pad(log_probs, [[0, 0], [0, tf.shape(mask)[1] - tf.shape(log_probs)[1]], [0, 0]], "CONSTANT", constant_values=0)
-        masked_log_probs = tf.cast(log_probs_padded, tf.float32) * tf.cast(mask[:, :, tf.newaxis], tf.float32)
-        log_prob = tf.reduce_mean(masked_log_probs) / tf.reduce_sum(tf.cast(mask, tf.float32))
-        
-        # 添加基线
-        baseline = tf.reduce_mean(lm_loss)
-        advantage = lm_loss - baseline
-        loss = -tf.cast(advantage, tf.float32) * log_prob
-    gradients = tape.gradient(loss, gen.trainable_variables)
-    print("reinforce gradients calculated")  # Debug info
-    gen_optimizer.apply_gradients(zip(gradients, gen.trainable_variables))
-    return loss
 
-# 训练参数
-trainconfig = pr.Trainconfig()
+# 检查点
+from multiprocessing import util
+checkpoint_dir = os.path.join(util.get_temp_dir(), 'ckpt')
 
-# 创建输入数据
-train_tf_dataset_X = ex.create_tf_dataset(train_dataset_X, trainconfig.batch_size)
-train_tf_dataset_Y = ex.create_tf_dataset(train_dataset_Y, trainconfig.batch_size)
-valid_tf_dataset_X = ex.create_tf_dataset(valid_dataset_X, trainconfig.batch_size)
-valid_tf_dataset_Y = ex.create_tf_dataset(valid_dataset_Y, trainconfig.batch_size)
-test_tf_dataset = ex.create_tf_dataset(test_dataset, trainconfig.batch_size)
+def _is_chief(task_type, task_id, cluster_spec):
+  return (task_type is None
+          or task_type == 'chief'
+          or (task_type == 'worker'
+              and task_id == 0
+              and "chief" not in cluster_spec.as_dict()))
+
+def _get_temp_dir(dirpath, task_id):
+  base_dirpath = 'workertemp_' + str(task_id)
+  temp_dir = os.path.join(dirpath, base_dirpath)
+  tf.io.gfile.makedirs(temp_dir)
+  return temp_dir
+
+def write_filepath(filepath, task_type, task_id, cluster_spec):
+  dirpath = os.path.dirname(filepath)
+  base = os.path.basename(filepath)
+  if not _is_chief(task_type, task_id, cluster_spec):
+    dirpath = _get_temp_dir(dirpath, task_id)
+  return os.path.join(dirpath, base)
+
+checkpoint = tf.train.Checkpoint(generator=generator, discriminator_Y=discriminator_Y, discriminator_Z=discriminator_Z)
+write_checkpoint_dir = write_filepath(checkpoint_dir, task_type, task_id, cluster_spec)
+checkpoint_manager = tf.train.CheckpointManager(checkpoint, directory=write_checkpoint_dir, max_to_keep=1)
+
+lastest_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
+if lastest_checkpoint:
+    checkpoint.restore(lastest_checkpoint)
 
 
 # 训练
 class Train(tf.keras.Model):
-    def __init__(self, gen, dis_Y, dis_Z, config):
+    def __init__(self, gen, dis_Y, dis_Z, config, strategy):
         super(Train, self).__init__()
         self.gen = gen
         self.dis_Y = dis_Y
         self.dis_Z = dis_Z
         self.cfg = config
+        self.strategy = strategy
         self.setup_optimizers()
         self.setup_metrics()
 
@@ -382,6 +381,10 @@ class Train(tf.keras.Model):
     
 
     def train(self, train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, epochs, *args, **kwargs):
+        train_dist_dataset_X = self.strategy.experimental_distribute_dataset(train_tf_dataset_X)
+        train_dist_dataset_Y = self.strategy.experimental_distribute_dataset(train_tf_dataset_Y)
+        valid_dist_dataset_X = self.strategy.experimental_distribute_dataset(valid_tf_dataset_X)
+
         for epoch in range(epochs):
             self.reset_metrics()
 
@@ -505,10 +508,9 @@ class Train(tf.keras.Model):
 
 
 # 实例化并训练
-train_model = Train(generator, discriminator_Y, discriminator_Z, trainconfig)
-
 import json
 
+# 先设置环境变量
 os.environ['TF_CONFIG'] = json.dumps({
     'cluster': {
         "chief": ["host1:2222"],
@@ -519,7 +521,23 @@ os.environ['TF_CONFIG'] = json.dumps({
 
 communication_options = tf.distribute.experimental.CommunicationOptions(implementation=tf.distribute.experimental.CommunicationImplementation.NCCL)
 mirrored_strategy = tf.distribute.MultiWorkerMirroredStrategy(communication_options=communication_options)
+
 with mirrored_strategy.scope():
+    generator, discriminator_Y, discriminator_Z, tokenizer = pre_load()
+
+    trainconfig = pr.Trainconfig()
+
+    train_dataset_X, train_dataset_Y, valid_dataset_X, valid_dataset_Y, \
+    test_dataset = pr.load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, seed=42)
+    train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, \
+    test_tf_dataset = pr.create_tf_dataset(train_dataset_X, trainconfig.batch_size, shuffle=True), \
+                      pr.create_tf_dataset(train_dataset_Y, trainconfig.batch_size, shuffle=True), \
+                      pr.create_tf_dataset(valid_dataset_X, trainconfig.batch_size, shuffle=False), \
+                      pr.create_tf_dataset(valid_dataset_Y, trainconfig.batch_size, shuffle=False), \
+                      pr.create_tf_dataset(test_dataset, trainconfig.batch_size, shuffle=False)
+    
+    train_model = Train(generator, discriminator_Y, discriminator_Z, trainconfig, mirrored_strategy)
+
     train_model.train(train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, trainconfig.epochs)
 
 # 测试集评估
