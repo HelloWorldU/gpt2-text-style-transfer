@@ -65,15 +65,13 @@ debug_file_path = os.path.join(current_dir, './experiment/debug.txt')
 
 accumulated_gradients = None
 
-mymodel = ex.MyModel(generator)
-
 # 自定义生成器训练步骤
 """
 in this task, we only trained X->Y.
 """
 @tf.function
 def train_generator_step(gen, gen_optimizer, dis_Y, dis_Z, input_ids, attention_mask, labels, styles, max_len, step, final_lr_schedule,
-                         accumulation_steps=4, lambda_rec=1.0, lambda_lm=1.0, lambda_adv=1.0, lambda_kl=1.0, gamma=1.0): 
+                         mymodel, accumulation_steps=4, lambda_rec=1.0, lambda_lm=1.0, lambda_adv=1.0, lambda_kl=1.0, gamma=1.0): 
     global accumulated_gradients
     def step_fn(input_ids=input_ids, attention_mask=attention_mask, labels=labels, styles=styles, max_len=max_len):
         with tf.GradientTape() as tape:
@@ -241,6 +239,38 @@ def train_generator_step(gen, gen_optimizer, dis_Y, dis_Z, input_ids, attention_
             total_accuracy / tf.cast(accumulation_steps, tf.float32))
 
 
+# REINFORCE算法
+@tf.function
+def reinforce_step(input_ids, attention_mask, labels, style_ids, max_len, gen, language_model, gen_optimizer):
+    with tf.GradientTape() as tape:
+        print("input_ids shape:", input_ids.shape)
+        print("attention_mask shape:", attention_mask.shape)
+        print("style_ids shape:", style_ids.shape)
+        style_ids = tf.expand_dims(style_ids, axis=1)
+        print("Fixed max_length:", max_len)
+        generated_ids = gen.generate(input_ids, attention_mask=attention_mask, max_length=max_len)
+        generated_attention_mask = tf.pad(attention_mask, [[0, 0], [0, generated_ids.shape[1] - attention_mask.shape[1]]], "CONSTANT", constant_values=1)
+        lm_loss = dis.compute_lm_loss(generated_ids, generated_attention_mask, language_model)
+        
+        outputs = gen(input_ids, attention_mask=attention_mask, labels=labels, training=False)
+        logits = outputs.logits
+        log_probs = tf.nn.log_softmax(logits, axis=-1)
+        seq_len = tf.shape(generated_ids)[1]
+        mask = tf.sequence_mask(tf.reduce_sum(tf.cast(generated_ids != gen.config.pad_token_id, tf.int32), axis=1), maxlen=seq_len)
+        log_probs_padded = tf.pad(log_probs, [[0, 0], [0, tf.shape(mask)[1] - tf.shape(log_probs)[1]], [0, 0]], "CONSTANT", constant_values=0)
+        masked_log_probs = tf.cast(log_probs_padded, tf.float32) * tf.cast(mask[:, :, tf.newaxis], tf.float32)
+        log_prob = tf.reduce_mean(masked_log_probs) / tf.reduce_sum(tf.cast(mask, tf.float32))
+        
+        # 添加基线
+        baseline = tf.reduce_mean(lm_loss)
+        advantage = lm_loss - baseline
+        loss = -tf.cast(advantage, tf.float32) * log_prob
+    gradients = tape.gradient(loss, gen.trainable_variables)
+    print("reinforce gradients calculated")  # Debug info
+    gen_optimizer.apply_gradients(zip(gradients, gen.trainable_variables))
+    return loss
+
+
 # 自定义鉴别器训练步骤
 @tf.function
 def train_discriminator_Y_step(real_ids, real_mask, generated_ids, model, optimizer, gamma=1.0):
@@ -289,48 +319,49 @@ def train_generator_with_discriminator_Z(gen, dis_Z, input_ids_X, input_ids_Y, a
     return disc_z_loss_X, disc_z_loss_Y
 
 
-# 检查点
-from multiprocessing import util
-checkpoint_dir = os.path.join(util.get_temp_dir(), 'ckpt')
+# # 检查点
+# from multiprocessing import util
+# checkpoint_dir = os.path.join(util.get_temp_dir(), 'ckpt')
 
-def _is_chief(task_type, task_id, cluster_spec):
-  return (task_type is None
-          or task_type == 'chief'
-          or (task_type == 'worker'
-              and task_id == 0
-              and "chief" not in cluster_spec.as_dict()))
+# def _is_chief(task_type, task_id, cluster_spec):
+#   return (task_type is None
+#           or task_type == 'chief'
+#           or (task_type == 'worker'
+#               and task_id == 0
+#               and "chief" not in cluster_spec.as_dict()))
 
-def _get_temp_dir(dirpath, task_id):
-  base_dirpath = 'workertemp_' + str(task_id)
-  temp_dir = os.path.join(dirpath, base_dirpath)
-  tf.io.gfile.makedirs(temp_dir)
-  return temp_dir
+# def _get_temp_dir(dirpath, task_id):
+#   base_dirpath = 'workertemp_' + str(task_id)
+#   temp_dir = os.path.join(dirpath, base_dirpath)
+#   tf.io.gfile.makedirs(temp_dir)
+#   return temp_dir
 
-def write_filepath(filepath, task_type, task_id, cluster_spec):
-  dirpath = os.path.dirname(filepath)
-  base = os.path.basename(filepath)
-  if not _is_chief(task_type, task_id, cluster_spec):
-    dirpath = _get_temp_dir(dirpath, task_id)
-  return os.path.join(dirpath, base)
+# def write_filepath(filepath, task_type, task_id, cluster_spec):
+#   dirpath = os.path.dirname(filepath)
+#   base = os.path.basename(filepath)
+#   if not _is_chief(task_type, task_id, cluster_spec):
+#     dirpath = _get_temp_dir(dirpath, task_id)
+#   return os.path.join(dirpath, base)
 
-checkpoint = tf.train.Checkpoint(generator=generator, discriminator_Y=discriminator_Y, discriminator_Z=discriminator_Z)
-write_checkpoint_dir = write_filepath(checkpoint_dir, task_type, task_id, cluster_spec)
-checkpoint_manager = tf.train.CheckpointManager(checkpoint, directory=write_checkpoint_dir, max_to_keep=1)
+# checkpoint = tf.train.Checkpoint(generator=generator, discriminator_Y=discriminator_Y, discriminator_Z=discriminator_Z)
+# write_checkpoint_dir = write_filepath(checkpoint_dir, task_type, task_id, cluster_spec)
+# checkpoint_manager = tf.train.CheckpointManager(checkpoint, directory=write_checkpoint_dir, max_to_keep=1)
 
-lastest_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
-if lastest_checkpoint:
-    checkpoint.restore(lastest_checkpoint)
+# lastest_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
+# if lastest_checkpoint:
+#     checkpoint.restore(lastest_checkpoint)
 
 
 # 训练
 class Train(tf.keras.Model):
-    def __init__(self, gen, dis_Y, dis_Z, config, strategy):
+    def __init__(self, gen, dis_Y, dis_Z, config, strategy, mymodel):
         super(Train, self).__init__()
         self.gen = gen
         self.dis_Y = dis_Y
         self.dis_Z = dis_Z
         self.cfg = config
         self.strategy = strategy
+        self.mymodel=mymodel
         self.setup_optimizers()
         self.setup_metrics()
 
@@ -421,10 +452,10 @@ class Train(tf.keras.Model):
                             self.dis_Y, self.dis_Z, batch_input_ids_X, 
                             batch_attention_mask_X, batch_labels_X, 
                             batch_styles_X, max_len, tf.cast(self.cfg.lr_step, tf.float32), 
-                            self.final_lr_schedule, self.cfg.accumulation_steps,
-                            self.cfg.lambda_rec, self.cfg.lambda_lm, 
-                            self.cfg.lambda_adv, self.cfg.lambda_kl, 
-                            self.cfg.gamma)
+                            self.final_lr_schedule, self.mymodel, 
+                            self.cfg.accumulation_steps,self.cfg.lambda_rec, 
+                            self.cfg.lambda_lm, self.cfg.lambda_adv, 
+                            self.cfg.lambda_kl, self.cfg.gamma)
                 
                 print("Training REINFORCE")
                 reinforce_loss = reinforce_step(batch_input_ids_X, 
@@ -527,6 +558,8 @@ with mirrored_strategy.scope():
 
     trainconfig = pr.Trainconfig()
 
+    mymodel = ex.MyModel(generator)
+
     train_dataset_X, train_dataset_Y, valid_dataset_X, valid_dataset_Y, \
     test_dataset = pr.load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, seed=42)
     train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, \
@@ -536,7 +569,7 @@ with mirrored_strategy.scope():
                       pr.create_tf_dataset(valid_dataset_Y, trainconfig.batch_size, shuffle=False), \
                       pr.create_tf_dataset(test_dataset, trainconfig.batch_size, shuffle=False)
     
-    train_model = Train(generator, discriminator_Y, discriminator_Z, trainconfig, mirrored_strategy)
+    train_model = Train(generator, discriminator_Y, discriminator_Z, trainconfig, mirrored_strategy, mymodel)
 
     train_model.train(train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, trainconfig.epochs)
 
