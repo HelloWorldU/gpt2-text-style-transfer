@@ -1,5 +1,7 @@
 from transformers import BertTokenizer, TFGPT2LMHeadModel
 import tensorflow as tf
+import pre_progress as pr
+import discriminator as dis
 
 # 加载预训练模型和分词器
 def create_model():
@@ -48,181 +50,224 @@ class WarmUpDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
         # 图模式下使用 tf.cond 进行条件判断
         return tf.cond(step < self.warmup_steps, warmup, decay)
 
+def setup_optimizers():
+    """
+    we use a polynomial decay learning rate schedule with warmup here.
+    """
+    initial_learning_rate = 1e-5
+    warmup_steps = 8 # 5%
+    decay_steps = 152
+    end_learning_rate = 1e-6
+
+    lr_schedule = tf.keras.optimizers.schedules.PolynomialDecay(
+        initial_learning_rate=initial_learning_rate,
+        decay_steps=decay_steps,
+        end_learning_rate=end_learning_rate,
+        power=1.0
+    )
+
+    final_lr_schedule = WarmUpDecay(
+        initial_learning_rate=initial_learning_rate,
+        decay_schedule_fn=lr_schedule,
+        warmup_steps=warmup_steps
+    )
+
+    gen_optimizer = tf.keras.optimizers.Adam(learning_rate=final_lr_schedule)
+    dis_Y_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
+    dis_Z_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
+
+    return gen_optimizer, dis_Y_optimizer, dis_Z_optimizer, final_lr_schedule
 
 accumulated_gradients = None
 
-# 自定义生成器训练步骤
+# 自定义训练步骤类
 """
 in this task, we only trained X->Y.
 """
-@tf.function
-def train_generator_step(gen, gen_optimizer, dis_Y, dis_Z, input_ids, attention_mask, labels, styles, max_len, step, final_lr_schedule,
-                         mymodel, accumulation_steps=4, lambda_rec=1.0, lambda_lm=1.0, lambda_adv=1.0, lambda_kl=1.0, gamma=1.0): 
-    global accumulated_gradients
-    def step_fn(input_ids=input_ids, attention_mask=attention_mask, labels=labels, styles=styles, max_len=max_len):
-        with tf.GradientTape() as tape:
-            tf.debugging.enable_check_numerics()
-            
-            epsilon = 1e-6 # 快速修复
+class Trainstep:
+    def __init__(self, gen, gen_optimizer, dis_Y, dis_Y_optimizer, dis_Z, dis_Z_optimizer, tokenizer, strategy):
+        self.strategy = strategy
+        with self.strategy.scope():
+            self.gen = gen
+            self.gen_optimizer = gen_optimizer
+            self.dis_Y = dis_Y
+            self.dis_Y_optimizer = dis_Y_optimizer
+            self.dis_Z = dis_Z
+            self.dis_Z_optimizer = dis_Z_optimizer
+            self.tokenizer = tokenizer
 
-            # 嵌入风格标签
-            style_embeddings = mymodel(styles)
-            print("Style embeddings shape:", style_embeddings.shape)  # Debug info
-            
-            # 将输入 ID 嵌入到相同的嵌入空间
-            input_embeddings = gen.transformer.wte(input_ids) # [batch_size, seq_len, n_embd]
-            print("Input embeddings shape:", input_embeddings.shape)  # Debug info
-            
-            extended_input_embeddings = input_embeddings + tf.expand_dims(style_embeddings, axis=1)
-            print("Extended embeddings shape:", extended_input_embeddings.shape)  # Debug info
 
-            input_ids, attention_mask, labels, styles = dis.convert_to_tensor(input_ids, attention_mask, labels, styles)
+    @tf.function
+    def train_generator_step(self, input_ids, attention_mask, labels, styles, max_len, step, final_lr_schedule, 
+                        mymodel, accumulation_steps=4, lambda_rec=1.0, lambda_lm=1.0, lambda_adv=1.0, lambda_kl=1.0, gamma=1.0): 
+        global accumulated_gradients
+        def step_fn(input_ids=input_ids, attention_mask=attention_mask, labels=labels, styles=styles, max_len=max_len, 
+            accumulation_steps=accumulation_steps, lambda_rec=lambda_rec, lambda_lm=lambda_lm, lambda_adv=lambda_adv, lambda_kl=lambda_kl, gamma=gamma):
+            with tf.GradientTape() as tape:
+                tf.debugging.enable_check_numerics()
+                
+                accumulation_steps, lambda_rec, lambda_lm, lambda_adv, lambda_kl, gamma = pr.conv_tensor_to_float(accumulation_steps, lambda_rec, lambda_lm, lambda_adv, lambda_kl, gamma)
 
-            outputs = gen(input_ids=input_ids, attention_mask=attention_mask, training=True)
-            logits = outputs.logits
-            print("Logits shape:", logits.shape)  # Debug info
-            print("labels shape:", labels.shape)  # Debug info
+                epsilon = 1e-6 # 快速修复
 
-            loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
-            mask = tf.cast(labels != -100, logits.dtype)
-            print("Mask shape:", mask.shape)  # Debug info
-    
-            # Check for NaN or Inf in logits
-            tf.debugging.check_numerics(logits, "Logits contain NaN or Inf")
+                # 嵌入风格标签
+                style_embeddings = mymodel(styles)
+                print("Style embeddings shape:", style_embeddings.shape)  # Debug info
+                
+                # 将输入 ID 嵌入到相同的嵌入空间
+                input_embeddings = self.gen.transformer.wte(input_ids) # [batch_size, seq_len, n_embd]
+                print("Input embeddings shape:", input_embeddings.shape)  # Debug info
+                
+                extended_input_embeddings = input_embeddings + tf.expand_dims(style_embeddings, axis=1)
+                print("Extended embeddings shape:", extended_input_embeddings.shape)  # Debug info
 
-            # 各个损失
-            rec_loss = loss_fn(tf.where(labels == -100, tf.zeros_like(labels, dtype=logits.dtype), tf.cast(labels, logits.dtype)), logits)
-            rec_loss = tf.reduce_sum(rec_loss * mask) / (tf.reduce_sum(mask) + epsilon)
-            print("Reconstruction loss:", rec_loss)  # Debug info
+                input_ids, attention_mask, labels, styles = dis.convert_tensor(input_ids, attention_mask, labels, styles)
 
-            for var in gen.trainable_variables:
-                tf.debugging.check_numerics(var, message="Model weight check")
+                outputs = self.gen(input_ids=input_ids, attention_mask=attention_mask, training=True)
+                logits = outputs.logits
+                print("Logits shape:", logits.shape)  # Debug info
+                print("labels shape:", labels.shape)  # Debug info
 
-            print("Input shapes:", 
-                     "input_ids:", input_ids.shape, 
-                     "attention_mask:", attention_mask.shape, 
-                     "labels:", labels.shape, 
-                     "styles:", styles.shape,
-                     "max_len:", max_len)
-
-            max_new_tokens = max_len - input_ids.shape[1] - 10
-            batch_size = input_ids.shape[0]
-
-            # 扩展 input_ids
-            padding = tf.zeros((batch_size, max_new_tokens), dtype=input_ids.dtype)
-            extended_input_ids = tf.concat([input_ids, padding], axis=1)
-            extended_attention_mask1 = tf.concat([attention_mask, tf.zeros((attention_mask.shape[0],
-                     max_new_tokens), dtype=attention_mask.dtype)], axis=1)
-            
-            print(f"Extended input_ids shape: {extended_input_ids.shape}")
-            print(f"Extended attention_mask shape: {extended_attention_mask1.shape}")
-
-            try:
-                generated_ids = gen.generate(
-                    extended_input_ids, 
-                    attention_mask=extended_attention_mask1, 
-                    max_length=max_len,  # 或者其他固定值
-                    min_length=input_ids.shape[1],
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    bos_token_id=tokenizer.bos_token_id,
-                    # use_cache=True,
-                    # num_beams=1,  # 使用贪婪搜索
-                    do_sample=False,  # 不使用采样
-                    # temperature=1.0,  # 降低随机性
-                )
-                print("Generation successful. Generated IDs shape:", generated_ids.shape)
-
-            except Exception as e:
-                print(f"Error during generation: {e}")
-                print(f"input_ids shape: {input_ids.shape}")
-                print(f"attention_mask shape: {attention_mask.shape}")
-                print(f"max_len: {max_len}")
-                raise
-            
-            generated_embeddings = gen.transformer.wte(generated_ids) # [batch_size, seq_len, n_embd]
-            extended_generated_embeddings = generated_embeddings + tf.expand_dims(style_embeddings, axis=1)
-            print("Generated extended embeddings shape:", extended_generated_embeddings.shape)  # Debug info
-
-            padded_input_ids = tf.pad(input_ids, [[0, 0], [0, generated_ids.shape[1] - input_ids.shape[1]]],
-                                       "CONSTANT", constant_values=tokenizer.pad_token_id)
-            zx_distribution = dis.compute_distribution(extended_input_embeddings, dis_Z)
-            zy_distribution = dis.compute_distribution(extended_generated_embeddings, dis_Z)
-            kl_loss = dis.kl_divergence(zx_distribution, zy_distribution)
-            print("KL loss:", kl_loss)  # Debug info
-
-            extended_attention_mask2 = tf.pad(attention_mask, [[0, 0],[0, generated_ids.shape[1] - attention_mask.shape[1]]], 
-                                        "CONSTANT", constant_values=1)
-            real_lm_loss_Y = dis.compute_lm_loss(generated_ids, extended_attention_mask2, dis_Y)
-            lm_loss = gamma * real_lm_loss_Y
-            print("LM loss:", lm_loss)  # Debug info
-
-            real_adv_loss = dis_Y(padded_input_ids, attention_mask=extended_attention_mask2, training=True)
-            generated_adv_loss = dis_Y(generated_ids, attention_mask=extended_attention_mask2, training=True)
-
-            real_adv_loss_logits = tf.clip_by_value(real_adv_loss.logits, -1e6, 1e6)
-            generated_adv_loss_logits = tf.clip_by_value(generated_adv_loss.logits, -1e6, 1e6)
-
-            adv_loss = dis.compute_adversarial_loss(real_adv_loss_logits, generated_adv_loss_logits)
-            print("Adversarial loss:", adv_loss)  # Debug info
-
-            total_loss = lambda_rec * rec_loss - lambda_lm * lm_loss + lambda_adv * adv_loss + lambda_kl * kl_loss
-            print("Total loss:", total_loss)  # Debug info
-
-            predictions = tf.argmax(logits, axis=-1)
-            predictions = tf.cast(predictions, tf.int32)
-            mask = tf.cast(mask, tf.float32)
-            accuracy = tf.reduce_sum(tf.cast(tf.equal(predictions, labels), tf.float32) * mask) / tf.reduce_sum(mask)
-            print("Accuracy:", accuracy)  # Debug info
-
-            # 梯度裁剪
-            gradients = tape.gradient(total_loss, gen.trainable_variables)
-            gradients, _ = tf.clip_by_global_norm(gradients, clip_norm=0.9)
-
-            # 数值稳定性检查
-            for grad in gradients:
-                tf.debugging.check_numerics(grad, "Gradient check")
+                loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
+                mask = tf.cast(labels != -100, logits.dtype)
+                print("Mask shape:", mask.shape)  # Debug info
         
-        print("Gradients calculated")  # Debug info
-        return total_loss, rec_loss, lm_loss, adv_loss, kl_loss, gradients, accuracy
+                # Check for NaN or Inf in logits
+                tf.debugging.check_numerics(logits, "Logits contain NaN or Inf")
 
-    
-    if accumulated_gradients is None:
-        accumulated_gradients = [tf.Variable(tf.zeros_like(g), trainable=False) for g in gen.trainable_variables]
-    total_loss = tf.constant(0.0, dtype=tf.float32)
-    total_rec_loss = tf.constant(0.0, dtype=tf.float32)
-    total_lm_loss = tf.constant(0.0, dtype=tf.float32)
-    total_adv_loss = tf.constant(0.0, dtype=tf.float32)
-    total_kl_loss = tf.constant(0.0, dtype=tf.float32)
-    total_accuracy = tf.constant(0.0, dtype=tf.float32)
-    
-    for _ in range(accumulation_steps):
-        step_total_loss, step_rec_loss, step_lm_loss, step_adv_loss, step_kl_loss, step_gradients, step_accuracy = step_fn()
-        total_loss += tf.cast(step_total_loss,tf.float32)
-        total_rec_loss += tf.cast(step_rec_loss, tf.float32)
-        total_lm_loss += tf.cast(step_lm_loss, tf.float32)
-        total_adv_loss += tf.cast(step_adv_loss, tf.float32)
-        total_kl_loss += tf.cast(step_kl_loss, tf.float32)
-        total_accuracy += step_accuracy
-        for i, g in enumerate(step_gradients):
-            accumulated_gradients[i].assign_add(g)
-    
-    for i, g in enumerate(accumulated_gradients):
-        accumulated_gradients[i].assign(g / tf.cast(accumulation_steps, g.dtype))
-    gen_optimizer.apply_gradients(zip(accumulated_gradients, gen.trainable_variables))
-    print("Gradients applied")  # Debug info
-    current_lr = final_lr_schedule(step)
-    
-    for grad in accumulated_gradients:
-        grad.assign(tf.zeros_like(grad))
+                # 各个损失
+                rec_loss = loss_fn(tf.where(labels == -100, tf.zeros_like(labels, dtype=logits.dtype), tf.cast(labels, logits.dtype)), logits)
+                rec_loss = tf.reduce_sum(rec_loss * mask) / (tf.reduce_sum(mask) + epsilon)
+                print("Reconstruction loss:", rec_loss)  # Debug info
 
-    return (total_loss / tf.cast(accumulation_steps, tf.float32),
-            total_rec_loss / tf.cast(accumulation_steps, tf.float32),
-            total_lm_loss / tf.cast(accumulation_steps, tf.float32),
-            total_adv_loss / tf.cast(accumulation_steps, tf.float32),
-            total_kl_loss / tf.cast(accumulation_steps, tf.float32),
-            current_lr,
-            total_accuracy / tf.cast(accumulation_steps, tf.float32))
+                for var in self.gen.trainable_variables:
+                    tf.debugging.check_numerics(var, message="Model weight check")
+
+                print("Input shapes:", 
+                        "input_ids:", input_ids.shape, 
+                        "attention_mask:", attention_mask.shape, 
+                        "labels:", labels.shape, 
+                        "styles:", styles.shape,
+                        "max_len:", max_len)
+
+                max_new_tokens = max_len - input_ids.shape[1] - 10
+                batch_size = input_ids.shape[0]
+
+                # 扩展 input_ids
+                padding = tf.zeros((batch_size, max_new_tokens), dtype=input_ids.dtype)
+                extended_input_ids = tf.concat([input_ids, padding], axis=1)
+                extended_attention_mask1 = tf.concat([attention_mask, tf.zeros((attention_mask.shape[0],
+                        max_new_tokens), dtype=attention_mask.dtype)], axis=1)
+                
+                print(f"Extended input_ids shape: {extended_input_ids.shape}")
+                print(f"Extended attention_mask shape: {extended_attention_mask1.shape}")
+
+                try:
+                    generated_ids = self.gen.generate(
+                        extended_input_ids, 
+                        attention_mask=extended_attention_mask1, 
+                        max_length=max_len,  # 或者其他固定值
+                        min_length=input_ids.shape[1],
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                        bos_token_id=self.tokenizer.bos_token_id,
+                        # use_cache=True,
+                        # num_beams=1,  # 使用贪婪搜索
+                        do_sample=False,  # 不使用采样
+                        # temperature=1.0,  # 降低随机性
+                    )
+                    print("Generation successful. Generated IDs shape:", generated_ids.shape)
+
+                except Exception as e:
+                    print(f"Error during generation: {e}")
+                    print(f"input_ids shape: {input_ids.shape}")
+                    print(f"attention_mask shape: {attention_mask.shape}")
+                    print(f"max_len: {max_len}")
+                    raise
+                
+                generated_embeddings = self.gen.transformer.wte(generated_ids) # [batch_size, seq_len, n_embd]
+                extended_generated_embeddings = generated_embeddings + tf.expand_dims(style_embeddings, axis=1)
+                print("Generated extended embeddings shape:", extended_generated_embeddings.shape)  # Debug info
+
+                padded_input_ids = tf.pad(input_ids, [[0, 0], [0, generated_ids.shape[1] - input_ids.shape[1]]],
+                                        "CONSTANT", constant_values=self.tokenizer.pad_token_id)
+                zx_distribution = dis.compute_distribution(extended_input_embeddings, self.dis_Z)
+                zy_distribution = dis.compute_distribution(extended_generated_embeddings, self.dis_Z)
+                kl_loss = dis.kl_divergence(zx_distribution, zy_distribution)
+                print("KL loss:", kl_loss)  # Debug info
+
+                extended_attention_mask2 = tf.pad(attention_mask, [[0, 0],[0, generated_ids.shape[1] - attention_mask.shape[1]]], 
+                                            "CONSTANT", constant_values=1)
+                real_lm_loss_Y = dis.compute_lm_loss(generated_ids, extended_attention_mask2, self.dis_Y)
+                lm_loss = gamma * real_lm_loss_Y
+                print("LM loss:", lm_loss)  # Debug info
+
+                real_adv_loss = self.dis_Y(padded_input_ids, attention_mask=extended_attention_mask2, training=True)
+                generated_adv_loss = self.dis_Y(generated_ids, attention_mask=extended_attention_mask2, training=True)
+
+                real_adv_loss_logits = tf.clip_by_value(real_adv_loss.logits, -1e6, 1e6)
+                generated_adv_loss_logits = tf.clip_by_value(generated_adv_loss.logits, -1e6, 1e6)
+
+                adv_loss = dis.compute_adversarial_loss(real_adv_loss_logits, generated_adv_loss_logits)
+                print("Adversarial loss:", adv_loss)  # Debug info
+
+                total_loss = lambda_rec * rec_loss - lambda_lm * lm_loss + lambda_adv * adv_loss + lambda_kl * kl_loss
+                print("Total loss:", total_loss)  # Debug info
+
+                predictions = tf.argmax(logits, axis=-1)
+                predictions = tf.cast(predictions, tf.int32)
+                mask = tf.cast(mask, tf.float32)
+                accuracy = tf.reduce_sum(tf.cast(tf.equal(predictions, labels), tf.float32) * mask) / tf.reduce_sum(mask)
+                print("Accuracy:", accuracy)  # Debug info
+
+                # 梯度裁剪
+                gradients = tape.gradient(total_loss, self.gen.trainable_variables)
+                gradients, _ = tf.clip_by_global_norm(gradients, clip_norm=0.9)
+
+                # 数值稳定性检查
+                for grad in gradients:
+                    tf.debugging.check_numerics(grad, "Gradient check")
+            
+            print("Gradients calculated")  # Debug info
+            return total_loss, rec_loss, lm_loss, adv_loss, kl_loss, gradients, accuracy
+
+        
+        if accumulated_gradients is None:
+            accumulated_gradients = [tf.Variable(tf.zeros_like(g), trainable=False) for g in self.gen.trainable_variables]
+        total_loss = tf.constant(0.0, dtype=tf.float32)
+        total_rec_loss = tf.constant(0.0, dtype=tf.float32)
+        total_lm_loss = tf.constant(0.0, dtype=tf.float32)
+        total_adv_loss = tf.constant(0.0, dtype=tf.float32)
+        total_kl_loss = tf.constant(0.0, dtype=tf.float32)
+        total_accuracy = tf.constant(0.0, dtype=tf.float32)
+        
+        for _ in range(accumulation_steps):
+            step_total_loss, step_rec_loss, step_lm_loss, step_adv_loss, step_kl_loss, step_gradients, step_accuracy = step_fn()
+            total_loss += tf.cast(step_total_loss,tf.float32)
+            total_rec_loss += tf.cast(step_rec_loss, tf.float32)
+            total_lm_loss += tf.cast(step_lm_loss, tf.float32)
+            total_adv_loss += tf.cast(step_adv_loss, tf.float32)
+            total_kl_loss += tf.cast(step_kl_loss, tf.float32)
+            total_accuracy += step_accuracy
+            for i, g in enumerate(step_gradients):
+                accumulated_gradients[i].assign_add(g)
+        
+        for i, g in enumerate(accumulated_gradients):
+            accumulated_gradients[i].assign(g / tf.cast(accumulation_steps, g.dtype))
+        self.gen_optimizer.apply_gradients(zip(accumulated_gradients, self.gen.trainable_variables))
+        print("Gradients applied")  # Debug info
+        current_lr = final_lr_schedule(step)
+        
+        for grad in accumulated_gradients:
+            grad.assign(tf.zeros_like(grad))
+
+        return (total_loss / tf.cast(accumulation_steps, tf.float32),
+                total_rec_loss / tf.cast(accumulation_steps, tf.float32),
+                total_lm_loss / tf.cast(accumulation_steps, tf.float32),
+                total_adv_loss / tf.cast(accumulation_steps, tf.float32),
+                total_kl_loss / tf.cast(accumulation_steps, tf.float32),
+                current_lr,
+                total_accuracy / tf.cast(accumulation_steps, tf.float32))
 
 
 # REINFORCE算法
