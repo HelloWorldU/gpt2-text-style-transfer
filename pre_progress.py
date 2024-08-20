@@ -4,7 +4,7 @@ import numpy as np
 import tensorflow as tf
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # 文本预处理
 def preprocess_text(input_file, output_file):
@@ -52,19 +52,19 @@ class TrainConfig:
     lambda_kl: float = 1.0
     gamma: float = 1.0
     label_smoothing: float = 0.1
-    train_losses: list = []
-    train_accuracies: list = []
-    rec_losses: list = []
-    lm_losses: list = []
-    adv_losses: list = []
-    kl_losses: list = []
-    disc_y_losses: list = []
-    disc_z_losses: list = []
-    reinforce_losses: list = []
-    valid_losses: list = []
-    valid_accuracies: list = []
-    perplexities: list = []
-    learning_rates: list = []
+    train_losses: list = field(default_factory=list)
+    train_accuracies: list = field(default_factory=list)
+    rec_losses: list = field(default_factory=list)
+    lm_losses: list = field(default_factory=list)
+    adv_losses: list = field(default_factory=list)
+    kl_losses: list = field(default_factory=list)
+    disc_y_losses: list = field(default_factory=list)
+    disc_z_losses: list = field(default_factory=list)
+    reinforce_losses: list = field(default_factory=list)
+    valid_losses: list = field(default_factory=list)
+    valid_accuracies: list = field(default_factory=list)
+    perplexities: list = field(default_factory=list)
+    learning_rates: list = field(default_factory=list)
     lr_step: int = 0
 
 
