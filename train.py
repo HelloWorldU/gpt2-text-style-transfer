@@ -71,64 +71,20 @@ accumulated_gradients = None
 #     checkpoint.restore(lastest_checkpoint)
 
 
-@tf.function 
-def distributed_train_generator_step(self, **kwargs):
-    per_replica_losses = self.strategy.run(md.train_generator_step, args=(**kwargs,))
-    return self.strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
-
-
-@tf.function
-def distributed_train_discriminator_Y_step(strategy, dataset_inputs):
-    per_replica_losses = strategy.run(md.train_discriminator_Y_step, args=(dataset_inputs,))
-    return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
-
-
-@tf.function
-def distributed_train_discriminator_Z_step(strategy, dataset_inputs):
-    per_replica_losses = strategy.run(md.train_discriminator_Z_step, args=(dataset_inputs,))
-    return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
-
 # 训练
 class Train(tf.keras.Model):
-    def __init__(self, gen, dis_Y, dis_Z, config, strategy, mymodel):
+    def __init__(self, gen, dis_Y, dis_Z, config, strategy, embedding, model):
         super(Train, self).__init__()
         self.cfg = config
         self.strategy = strategy
-        self.mymodel=mymodel
+        self.embedding=embedding
+        self.model = model
 
         with self.strategy.scope():
             self.gen = gen
             self.dis_Y = dis_Y
             self.dis_Z = dis_Z
-            self.setup_optimizers()
             self.setup_metrics()
-
-
-    def setup_optimizers(self):
-        """
-        we use a polynomial decay learning rate schedule with warmup here.
-        """
-        initial_learning_rate = 1e-5
-        warmup_steps = 8 # 5%
-        decay_steps = 152
-        end_learning_rate = 1e-6
-
-        lr_schedule = tf.keras.optimizers.schedules.PolynomialDecay(
-            initial_learning_rate=initial_learning_rate,
-            decay_steps=decay_steps,
-            end_learning_rate=end_learning_rate,
-            power=1.0
-        )
-
-        self.final_lr_schedule = md.WarmUpDecay(
-            initial_learning_rate=initial_learning_rate,
-            decay_schedule_fn=lr_schedule,
-            warmup_steps=warmup_steps
-        )
-
-        self.gen_optimizer = tf.keras.optimizers.Adam(learning_rate=self.final_lr_schedule)
-        self.dis_Y_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
-        self.dis_Z_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
 
 
     def setup_metrics(self):
@@ -148,22 +104,36 @@ class Train(tf.keras.Model):
         for metric in self.metrics.values():
             metric.reset_states()
 
+
     @tf.function 
-    def distributed_train_generator_step(self, **kwargs):
-        gen_dict = self.strategy.run(md.train_generator_step, args=(**kwargs,))
-        return self.strategy.reduce(tf.distribute.ReduceOp.SUM, gen_dict, axis=None)
+    def distributed_train_generator_step(self, *args, **kwargs):
+        for key, value in kwargs.items():
+            if not isinstance(value, tf.Tensor):
+                kwargs[key]= tf.convert_to_tensor(value)
+        loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, \
+        accuracy = self.strategy.run(md.train_generator_step, arg=(*args,), **kwargs)
+        final_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, loss, axis=None)
+        return loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy, final_loss
 
 
     @tf.function
-    def distributed_train_discriminator_Y_step(self, dataset_inputs):
-        dis_Y_dict = self.strategy.run(md.train_discriminator_Y_step, args=(dataset_inputs,))
-        return self.strategy.reduce(tf.distribute.ReduceOp.SUM, dis_Y_dict, axis=None)
+    def distributed_train_reinforce_step(self, *args, **kwargs):
+        reinforce_loss = self.strategy.run(md.reinforce_step, arg=(*args,), **kwargs)
+        return self.strategy.reduce(tf.distribute.ReduceOp.SUM, reinforce_loss, axis=None)
 
 
     @tf.function
-    def distributed_train_discriminator_Z_step(self, dataset_inputs):
-        dis_Z_dict = self.strategy.run(md.train_discriminator_Z_step, args=(dataset_inputs,))
-        return self.strategy.reduce(tf.distribute.ReduceOp.SUM, dis_Z_dict, axis=None)
+    def distributed_train_discriminator_Y_step(self, *args, **kwargs):
+        disc_loss_Y, real_loss_Y, fake_loss_Y = self.strategy.run(md.train_discriminator_Y_step, arg=(*args,), **kwargs)
+        final_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, disc_loss_Y, axis=None)
+        return disc_loss_Y, real_loss_Y , fake_loss_Y, final_loss
+
+
+    @tf.function
+    def distributed_train_discriminator_Z_step(self, *args, **kwargs):
+        disc_z_loss_X, disc_z_loss_Y = self.strategy.run(md.train_discriminator_Z_step, arg=(*args,), **kwargs)
+        final_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, (disc_z_loss_X + disc_z_loss_Y) / 2.0, axis=None)
+        return disc_z_loss_X, disc_z_loss_Y, final_loss
     
 
     def train(self, train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, epochs, *args, **kwargs):
@@ -203,7 +173,7 @@ class Train(tf.keras.Model):
 
                 print("Training gen")
                 loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr \
-                , accuracy = train_generator_step(self.gen, self.gen_optimizer, 
+                , accuracy, final_loss = self.distributed_train_generator_step(self.gen, self.gen_optimizer, 
                             self.dis_Y, self.dis_Z, batch_input_ids_X, 
                             batch_attention_mask_X, batch_labels_X, 
                             batch_styles_X, max_len, tf.cast(self.cfg.lr_step, tf.float32), 
@@ -213,21 +183,21 @@ class Train(tf.keras.Model):
                             self.cfg.lambda_kl, self.cfg.gamma)
                 
                 print("Training REINFORCE")
-                reinforce_loss = reinforce_step(batch_input_ids_X, 
-                                batch_attention_mask_X, batch_labels_X, 
-                                batch_styles_X, max_len, self.gen, 
-                                self.dis_Y, self.gen_optimizer)
+                reinforce_loss = self.distributed_train_reinforce_step(batch_input_ids_X, 
+                                                batch_attention_mask_X, batch_labels_X, 
+                                                batch_styles_X, max_len, self.gen, 
+                                                self.dis_Y, self.gen_optimizer)
 
                 generated_ids_Y = self.gen.generate(batch_input_ids_X, attention_mask=batch_attention_mask_X, max_length=max_len)
 
                 print("Training discriminator Y")
-                disc_loss_Y, real_loss_Y \
-                , fake_loss_Y = train_discriminator_Y_step(batch_input_ids_Y, 
+                disc_loss_Y, real_loss_Y, fake_loss_Y \
+                , final_loss = self.distributed_train_discriminator_Y_step(batch_input_ids_Y, 
                                 batch_attention_mask_Y, generated_ids_Y, 
                                 self.dis_Y, self.dis_Y_optimizer, self.cfg.gamma)
                 
                 print("Training discriminator Z")
-                disc_z_loss_X, disc_z_loss_Y = train_generator_with_discriminator_Z(
+                disc_z_loss_X, disc_z_loss_Y, final_loss = self.distributed_train_discriminator_Z_step(
                                 self.gen, self.dis_Z, batch_input_ids_X, 
                                 batch_input_ids_Y, batch_attention_mask_X, 
                                 batch_attention_mask_Y, batch_styles_X, 
@@ -313,7 +283,7 @@ with mirrored_strategy.scope():
 
     trainconfig = pr.Trainconfig()
 
-    mymodel = ex.MyModel(generator)
+    embedding = ex.Embedding(generator)
 
     train_dataset_X, train_dataset_Y, valid_dataset_X, valid_dataset_Y, \
     test_dataset = pr.load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, seed=42)
@@ -324,7 +294,11 @@ with mirrored_strategy.scope():
                       pr.create_tf_dataset(valid_dataset_Y, trainconfig.batch_size, shuffle=False), \
                       pr.create_tf_dataset(test_dataset, trainconfig.batch_size, shuffle=False)
     
-    train_model = Train(generator, discriminator_Y, discriminator_Z, trainconfig, mirrored_strategy, mymodel)
+    gen_optimizer, dis_Y_optimizer, dis_Z_optimizer, final_lr_schedule = md.setup_optimizers()
+
+    model = md.Trainstep(generator, gen_optimizer, discriminator_Y, dis_Y_optimizer, discriminator_Z, dis_Z_optimizer, tokenizer, mirrored_strategy)
+
+    train_model = Train(generator, discriminator_Y, discriminator_Z, trainconfig, mirrored_strategy, embedding, model)
 
     train_model.train(train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, trainconfig.epochs)
 
