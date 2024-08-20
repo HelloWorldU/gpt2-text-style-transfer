@@ -166,3 +166,11 @@ def create_tf_dataset(dataset, batch_size, drop_remainder=True, shuffle=True, sh
     tf_dataset = tf_dataset.with_options(options)    
 
     return tf_dataset
+
+
+# 张量转换
+def conv_tensor_to_int(**kwargs):
+    for key, value in kwargs.items():
+        if isinstance(value, tf.Tensor):
+            kwargs[key] = tf.cast(value, tf.float32)
+    return kwargs
