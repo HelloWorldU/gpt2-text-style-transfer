@@ -42,8 +42,8 @@ def set_seed(seed=42) -> tuple:
 # 训练配置
 @dataclass
 class TrainConfig:
-    epochs: int = 10
-    batch_size: int = 4
+    epochs: int = 2
+    batch_size: int = 2
     max_len: int = 0
     accumulation_steps: int = 2
     lambda_rec: float = 1.0
@@ -73,6 +73,9 @@ def load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, split_rati
     if seed is not None:
         random.seed(seed)
 
+    # 最大长度截断
+    max_length = 301
+
     def read_and_tokenize(file_path, style):
         with tf.io.gfile.GFile(file_path, 'r') as f:
             lines = f.read().splitlines()
@@ -80,8 +83,8 @@ def load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, split_rati
         train_lines = lines[:split]
         valid_lines = lines[split:]
         
-        train_encoded = tokenizer(train_lines, truncation=True, padding=False)
-        valid_encoded = tokenizer(valid_lines, truncation=True, padding=False)
+        train_encoded = tokenizer(train_lines, truncation=True, padding=False, max_length=max_length)
+        valid_encoded = tokenizer(valid_lines, truncation=True, padding=False, max_length=max_length)
 
         train_dataset = (
             train_encoded['input_ids'],
@@ -105,7 +108,7 @@ def load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, split_rati
     test_dataset = (
         test_encoded['input_ids'], 
         test_encoded['attention_mask'], 
-        [0] * len(test_lines)
+        [1] * len(test_lines)
     )
 
     return (train_dataset_X, train_dataset_Y, valid_dataset_X, valid_dataset_Y, test_dataset)
