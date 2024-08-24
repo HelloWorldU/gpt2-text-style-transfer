@@ -184,7 +184,6 @@ def conv_tensor_to_float(*args):
 
 
 # 获取参数
-@tf.function
 def get_params(batch_X):
     input_ids = batch_X['input_ids']
     attention_mask = batch_X['attention_mask']
@@ -194,7 +193,6 @@ def get_params(batch_X):
 
 
 # 移除前导维数
-@tf.function
 def remove_leading_dim(input_ids, attention_mask):
     input_ids = tf.squeeze(input_ids, axis=0)
     attention_mask = tf.squeeze(attention_mask, axis=0)
