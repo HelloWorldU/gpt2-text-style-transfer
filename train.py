@@ -1,19 +1,22 @@
 from transformers import BertTokenizer, TFGPT2LMHeadModel
 import tensorflow as tf
+from tensorflow.keras.callbacks import TensorBoard
 import os
 import experiment as ex
 import discriminator as dis
 import pre_progress as pr
 import model as md
 import logging
+import datetime
 
 # 日志级别
-logging.basicConfig(level=logging.INFO)
+# logging.basicConfig(level=logging.INFO)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+tf.get_logger().setLevel('ERROR')
 
 # 环境guarantee
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-os.environ.pop('TF_CONFIG', None)
-
+# os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+# os.environ.pop('TF_CONFIG', None)
 
 # os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices=false'
 tf.config.optimizer.set_jit(False)  # 禁用 XLA
@@ -25,7 +28,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 # tf.config.run_functions_eagerly(True)
 
 # 混合精度
-from tensorflow.keras.mixed_precision import set_global_policy
+# from tensorflow.keras.mixed_precision import set_global_policy
 # set_global_policy('mixed_float16')
 
 
@@ -72,9 +75,8 @@ accumulated_gradients = None
 
 
 # 训练
-class Train(tf.keras.Model):
+class Train:
     def __init__(self, config, strategy, model):
-        super(Train, self).__init__()
         self.config = config
         self.strategy = strategy
         self.model = model
@@ -99,59 +101,97 @@ class Train(tf.keras.Model):
             metric.reset_states()
 
 
-    @tf.function 
-    def distributed_train_generator_step(self, *args, **kwargs):
+    # @tf.function 
+    def distributed_train_generator_step(self, batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X, *args, **kwargs):
+        new_args = []
         for arg in args:
-            if not isinstance(arg, tf.Tensor):
-                args = tf.convert_to_tensor(arg)
+            if isinstance(arg, tf.Tensor):
+                new_args.append(arg)
+            else:
+                new_args.append(tf.convert_to_tensor(arg, dtype=tf.int32))
+        
+        new_kwargs = {}
         for key, value in kwargs.items():
-            if not isinstance(value, tf.Tensor):
-                kwargs[key]= tf.convert_to_tensor(value)
-        loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, \
-        accuracy = self.strategy.run(self.model.train_generator_step, arg=(*args,), **kwargs)
-        final_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, loss, axis=None)
-        return loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy, final_loss
+            if isinstance(value, tf.Tensor):
+                new_kwargs[key] = value
+            else:
+                new_kwargs[key] = tf.convert_to_tensor(value)
+        
+        loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy = self.strategy.run(
+            self.model.train_generator_step, 
+            args=(batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X, *new_args), 
+            kwargs=new_kwargs
+        )
+        total_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, loss, axis=None)
+        return loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy, total_loss
 
 
-    @tf.function
+
+    # @tf.function
     def distributed_train_reinforce_step(self, *args, **kwargs):
+        new_args = []
         for arg in args:
             if not isinstance(arg, tf.Tensor):
-                args = tf.convert_to_tensor(arg)
+                arg = tf.convert_to_tensor(arg, dtype=tf.int32)
+            new_args.append(arg)
+
+        new_kwargs = {}
         for key, value in kwargs.items():
-            if not isinstance(value, tf.Tensor):
-                kwargs[key]= tf.convert_to_tensor(value)
-        reinforce_loss = self.strategy.run(self.model.reinforce_step, arg=(*args,), **kwargs)
+            if isinstance(value, tf.Tensor):
+                new_kwargs[key] = value
+            else:
+                new_kwargs[key] = tf.convert_to_tensor(value)
+
+        reinforce_loss = self.strategy.run(self.model.reinforce_step, args=(new_args), kwargs=new_kwargs)
         return self.strategy.reduce(tf.distribute.ReduceOp.SUM, reinforce_loss, axis=None)
 
 
-    @tf.function
+    # @tf.function
     def distributed_train_discriminator_Y_step(self, *args, **kwargs):
+        new_args = []
         for arg in args:
             if not isinstance(arg, tf.Tensor):
-                args = tf.convert_to_tensor(arg)
+                arg = tf.convert_to_tensor(arg, dtype=tf.int32)
+            new_args.append(arg)
+
+        new_kwargs = {}
         for key, value in kwargs.items():
-            if not isinstance(value, tf.Tensor):
-                kwargs[key]= tf.convert_to_tensor(value)
-        disc_loss_Y, real_loss_Y, fake_loss_Y = self.strategy.run(self.model.train_discriminator_Y_step, arg=(*args,), **kwargs)
-        final_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, disc_loss_Y, axis=None)
-        return disc_loss_Y, real_loss_Y , fake_loss_Y, final_loss
+            if isinstance(value, tf.Tensor):
+                new_kwargs[key] = value
+            else:
+                new_kwargs[key] = tf.convert_to_tensor(value)
+
+        disc_loss_Y, real_loss_Y, fake_loss_Y = self.strategy.run(self.model.train_discriminator_Y_step, args=(*new_args,), kwargs=new_kwargs)
+        total_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, disc_loss_Y, axis=None)
+        return disc_loss_Y, real_loss_Y, fake_loss_Y, total_loss
 
 
-    @tf.function
+    # @tf.function
     def distributed_train_discriminator_Z_step(self, *args, **kwargs):
+        new_args = []
         for arg in args:
             if not isinstance(arg, tf.Tensor):
-                args = tf.convert_to_tensor(arg)
+                arg = tf.convert_to_tensor(arg, dtype=tf.int32)
+            new_args.append(arg)
+
+        new_kwargs = {}
         for key, value in kwargs.items():
-            if not isinstance(value, tf.Tensor):
-                kwargs[key]= tf.convert_to_tensor(value)
-        disc_z_loss_X, disc_z_loss_Y = self.strategy.run(self.model.train_generator_with_discriminator_Z, arg=(*args,), **kwargs)
-        final_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, (disc_z_loss_X + disc_z_loss_Y) / 2.0, axis=None)
-        return disc_z_loss_X, disc_z_loss_Y, final_loss
+            if isinstance(value, tf.Tensor):
+                new_kwargs[key] = value
+            else:
+                new_kwargs[key] = tf.convert_to_tensor(value)
+
+        disc_z_loss_X, disc_z_loss_Y = self.strategy.run(self.model.train_generator_with_discriminator_Z, arg=new_args, kwargs=new_kwargs)
+        total_Z_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, (disc_z_loss_X + disc_z_loss_Y) / 2.0, axis=None)
+        return disc_z_loss_X, disc_z_loss_Y, total_Z_loss
     
 
     def train(self, train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, epochs, *args, **kwargs):
+        print("Before Train start, test the dataset_X first:")
+        for element in train_tf_dataset_X.take(1):
+            print("ids:", element['input_ids'])
+            print("mask:", element['attention_mask'])
+            print("style:", element['style'])
         train_dist_dataset_X = self.strategy.experimental_distribute_dataset(train_tf_dataset_X)
         train_dist_dataset_Y = self.strategy.experimental_distribute_dataset(train_tf_dataset_Y)
         valid_dist_dataset_X = self.strategy.experimental_distribute_dataset(valid_tf_dataset_X)
@@ -162,23 +202,37 @@ class Train(tf.keras.Model):
             for batch_X, batch_Y in zip(train_dist_dataset_X, train_dist_dataset_Y):
                 print(f"Train Epoch {epoch + 1} started")
 
-                batch_input_ids_X = batch_X['input_ids']
-                batch_attention_mask_X = batch_X['attention_mask']
-                batch_labels_X = ex.create_labels(batch_input_ids_X, batch_attention_mask_X)
-                batch_styles_X = batch_X['style']
-
-                batch_input_ids_Y = batch_Y['input_ids']
-                batch_attention_mask_Y = batch_Y['attention_mask']
-                batch_labels_Y = ex.create_labels(batch_input_ids_Y, batch_attention_mask_Y)
-                batch_styles_Y = batch_Y['style']
+                batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X = pr.get_params(batch_X)
+                batch_input_ids_Y, batch_attention_mask_Y, batch_labels_Y, batch_styles_Y = pr.get_params(batch_Y)
+                """
+                we got the PerReplica object from the dataset
+                """
                 print("Processing batch")
 
+                # print("batch_input_ids_X shape:", tf.shape(batch_input_ids_X))
+                # print("batch_attention_mask_X shape:", batch_attention_mask_X.shape)
+                # print("batch_input_ids_Y shape:", batch_input_ids_Y.shape)
+                # print("batch_attention_mask_Y.shape:", batch_attention_mask_Y.shape)
+
+                for element in train_tf_dataset_X.take(1):
+                    max_len, padded_input_ids, padded_attention_mask = dis.dynamic_padding(
+                        element['input_ids'], element['attention_mask']
+                    )
+                    padded_input_ids = tf.convert_to_tensor(padded_input_ids, dtype=tf.int32)
+                    padded_attention_mask = tf.convert_to_tensor(padded_attention_mask, dtype=tf.int32)
+                    print("Padded input_ids shape:", padded_input_ids.shape)
+                    print("Padded attention_mask shape:", padded_attention_mask.shape)
                 # 动态 Padding
                 max_len_X, batch_input_ids_X, batch_attention_mask_X = dis.dynamic_padding(batch_input_ids_X, batch_attention_mask_X)
                 max_len_Y, batch_input_ids_Y, batch_attention_mask_Y = dis.dynamic_padding(batch_input_ids_Y, batch_attention_mask_Y)
-                max_len = max(max_len_X, max_len_Y) + 101
-                
+                max_len = tf.reduce_max(tf.stack([max_len_X, max_len_Y])) + 101
+                print("max_len:", max_len)
+                # max_len = tf.get_static_value(max_len)
+                # print("max_len:", max_len)
+
+                batch_input_ids_X = tf.convert_to_tensor(batch_input_ids_X, dtype=tf.int32)
                 batch_attention_mask_X = tf.convert_to_tensor(batch_attention_mask_X, dtype=tf.int32)
+                batch_input_ids_Y = tf.convert_to_tensor(batch_input_ids_Y, dtype=tf.int32)
                 batch_attention_mask_Y = tf.convert_to_tensor(batch_attention_mask_Y, dtype=tf.int32)
 
                 print("batch_input_ids_X shape:", batch_input_ids_X.shape)
@@ -187,11 +241,11 @@ class Train(tf.keras.Model):
                 print("batch_attention_mask_Y.shape:", batch_attention_mask_Y.shape)
 
                 print("Training gen")
-                loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy, final_loss = self.distributed_train_generator_step(
-                    batch_input_ids_X, 
-                    batch_attention_mask_X, 
-                    batch_labels_X, 
-                    batch_styles_X, 
+                loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy, total_gen_loss = self.distributed_train_generator_step(
+                    batch_input_ids_X,
+                    batch_attention_mask_X,
+                    batch_labels_X,
+                    batch_styles_X,
                     max_len, 
                     tf.cast(self.config.lr_step, tf.float32), 
                     accumulation_steps=self.config.accumulation_steps,
@@ -211,18 +265,18 @@ class Train(tf.keras.Model):
                     max_len,
                 )
 
-                generated_ids_Y = self.gen.generate(batch_input_ids_X, attention_mask=batch_attention_mask_X, max_length=max_len)
-
                 print("Training discriminator Y")
-                disc_loss_Y, real_loss_Y, fake_loss_Y, final_loss = self.distributed_train_discriminator_Y_step(
+                disc_loss_Y, real_loss_Y, fake_loss_Y, total__Y_loss = self.distributed_train_discriminator_Y_step(
                     batch_input_ids_Y, 
                     batch_attention_mask_Y, 
-                    generated_ids_Y, 
-                    self.config.gamma
+                    batch_input_ids_X,
+                    batch_attention_mask_X,
+                    max_len, 
+                    gamma=self.config.gamma
                 )
                 
                 print("Training discriminator Z")
-                disc_z_loss_X, disc_z_loss_Y, final_loss = self.distributed_train_discriminator_Z_step(
+                disc_z_loss_X, disc_z_loss_Y, total_Z_loss = self.distributed_train_discriminator_Z_step(
                     batch_input_ids_X, 
                     batch_input_ids_Y, 
                     batch_attention_mask_X, 
@@ -230,18 +284,18 @@ class Train(tf.keras.Model):
                     batch_styles_X, 
                     batch_styles_Y, 
                     max_len, 
-                    self.config.label_smoothing
+                    label_smoothing=self.config.label_smoothing
                 )
                 
                 self.update_metrics(
-                    train_loss=loss,
+                    train_loss=total_gen_loss,
                     train_accuracy=accuracy,
                     rec_loss=rec_loss,
                     lm_loss=lm_loss,
                     adv_loss=adv_loss,
                     kl_loss=kl_loss,
-                    disc_y_loss=disc_loss_Y,
-                    disc_z_loss=(disc_z_loss_X + disc_z_loss_Y) / 2.0,
+                    disc_y_loss=total__Y_loss,
+                    disc_z_loss=total_Z_loss,
                     reinforce_loss=reinforce_loss,
                     learning_rate=current_lr
                 )
@@ -296,33 +350,44 @@ class Train(tf.keras.Model):
 import json
 
 # 先设置环境变量
-os.environ['TF_CONFIG'] = json.dumps({
-    'cluster': {
-        "chief": ["host1:2222"],
-        "worker": ["host2:2222", "host3:2222", "host4:2222"]
-    },
-    "task": {"type": "worker", "index": 1}
-})
+# os.environ['TF_CONFIG'] = json.dumps({
+#     'cluster': {
+#         "chief": ["host1:2222"],
+#         "worker": ["host2:2222", "host3:2222", "host4:2222"]
+#     },
+#     "task": {"type": "worker", "index": 1}
+# })
 
-communication_options = tf.distribute.experimental.CommunicationOptions(implementation=tf.distribute.experimental.CommunicationImplementation.NCCL)
-mirrored_strategy = tf.distribute.MultiWorkerMirroredStrategy(communication_options=communication_options)
+# communication_options = tf.distribute.experimental.CommunicationOptions(implementation=tf.distribute.experimental.CommunicationImplementation.NCCL)
+# mirrored_strategy = tf.distribute.MirroredStrategy()
+mirrored_strategy = tf.distribute.OneDeviceStrategy(device="/gpu:0")
 
 with mirrored_strategy.scope():
     generator, discriminator_Y, discriminator_Z, tokenizer = md.create_model()
 
-    trainconfig = pr.Trainconfig()
+    trainconfig = pr.TrainConfig()
 
     embedding = ex.Embedding(generator)
 
-    train_dataset_X, train_dataset_Y, valid_dataset_X, valid_dataset_Y, \
-    test_dataset = pr.load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, seed=42)
-    train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, \
-    test_tf_dataset = pr.create_tf_dataset(train_dataset_X, trainconfig.batch_size, shuffle=True), \
-                      pr.create_tf_dataset(train_dataset_Y, trainconfig.batch_size, shuffle=True), \
-                      pr.create_tf_dataset(valid_dataset_X, trainconfig.batch_size, shuffle=False), \
-                      pr.create_tf_dataset(valid_dataset_Y, trainconfig.batch_size, shuffle=False), \
-                      pr.create_tf_dataset(test_dataset, trainconfig.batch_size, shuffle=False)
-    
+    train_dataset_X, train_dataset_Y, valid_dataset_X, valid_dataset_Y, test_dataset = pr.load_dataset(
+        file_path_X, file_path_Y, test_file_path, tokenizer, seed=42
+    )
+
+    train_tf_dataset_X = pr.create_tf_dataset(train_dataset_X, trainconfig.batch_size)
+    train_tf_dataset_Y = pr.create_tf_dataset(train_dataset_Y, trainconfig.batch_size)
+    valid_tf_dataset_X = pr.create_tf_dataset(valid_dataset_X, trainconfig.batch_size)
+    valid_tf_dataset_Y = pr.create_tf_dataset(valid_dataset_Y, trainconfig.batch_size)
+    test_tf_dataset = pr.create_tf_dataset(test_dataset, trainconfig.batch_size)
+
+    # 检查数据集
+    for dataset_name, dataset in [("train_X", train_tf_dataset_X), ("train_Y", train_tf_dataset_Y), 
+                              ("valid_X", valid_tf_dataset_X), ("valid_Y", valid_tf_dataset_Y)]:
+        for batch in dataset.take(1):
+            print(f"{dataset_name} shape:")
+            print(f"  input_ids: {batch['input_ids'].shape}")
+            print(f"  attention_mask: {batch['attention_mask'].shape}")
+            print(f"  style: {batch['style'].shape}")
+
     gen_optimizer, dis_Y_optimizer, dis_Z_optimizer, final_lr_schedule = md.setup_optimizers()
 
     model = md.Trainstep(
@@ -336,14 +401,14 @@ with mirrored_strategy.scope():
         embedding, 
         mirrored_strategy,
         final_lr_schedule
-        )
+    )
 
     train_model = Train(trainconfig, mirrored_strategy, model)
 
     train_model.train(train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, trainconfig.epochs)
 
 # 测试集评估
-test_accuracies, test_losses, test_perplexity = ex.test_evalution(generator, ex.test_step,test_tf_dataset)
+test_accuracies, test_losses, test_perplexity = ex.test_evalution(generator, ex.test_step, test_tf_dataset)
 
 # 保存绘图
 save_dir = './experiment'
