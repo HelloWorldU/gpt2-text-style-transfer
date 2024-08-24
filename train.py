@@ -91,7 +91,7 @@ class Train:
 
 
     def update_metrics(self, **kwargs) -> None:
-        for name, value in kwargs:
+        for name, value in kwargs.items():
             if name in self.metrics:
                 self.metrics[name].update_state(value)
 
@@ -181,7 +181,7 @@ class Train:
             else:
                 new_kwargs[key] = tf.convert_to_tensor(value)
 
-        disc_z_loss_X, disc_z_loss_Y = self.strategy.run(self.model.train_generator_with_discriminator_Z, arg=new_args, kwargs=new_kwargs)
+        disc_z_loss_X, disc_z_loss_Y = self.strategy.run(self.model.train_generator_with_discriminator_Z, args=new_args, kwargs=new_kwargs)
         total_Z_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, (disc_z_loss_X + disc_z_loss_Y) / 2.0, axis=None)
         return disc_z_loss_X, disc_z_loss_Y, total_Z_loss
     
@@ -198,9 +198,11 @@ class Train:
 
         for epoch in range(epochs):
             self.reset_metrics()
+            train_batch = 0
+            valid_batch = 0
 
             for batch_X, batch_Y in zip(train_dist_dataset_X, train_dist_dataset_Y):
-                print(f"Train Epoch {epoch + 1} started")
+                print(f"Train Epoch {epoch + 1} started, batch {train_batch + 1}")
 
                 batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X = pr.get_params(batch_X)
                 batch_input_ids_Y, batch_attention_mask_Y, batch_labels_Y, batch_styles_Y = pr.get_params(batch_Y)
@@ -209,26 +211,20 @@ class Train:
                 """
                 print("Processing batch")
 
-                # print("batch_input_ids_X shape:", tf.shape(batch_input_ids_X))
-                # print("batch_attention_mask_X shape:", batch_attention_mask_X.shape)
-                # print("batch_input_ids_Y shape:", batch_input_ids_Y.shape)
-                # print("batch_attention_mask_Y.shape:", batch_attention_mask_Y.shape)
+                # for element in train_tf_dataset_X.take(1):
+                #     max_len, padded_input_ids, padded_attention_mask = dis.dynamic_padding(
+                #         element['input_ids'], element['attention_mask']
+                #     )
+                #     padded_input_ids = tf.convert_to_tensor(padded_input_ids, dtype=tf.int32)
+                #     padded_attention_mask = tf.convert_to_tensor(padded_attention_mask, dtype=tf.int32)
+                #     print("Padded input_ids shape:", padded_input_ids.shape)
+                #     print("Padded attention_mask shape:", padded_attention_mask.shape)
 
-                for element in train_tf_dataset_X.take(1):
-                    max_len, padded_input_ids, padded_attention_mask = dis.dynamic_padding(
-                        element['input_ids'], element['attention_mask']
-                    )
-                    padded_input_ids = tf.convert_to_tensor(padded_input_ids, dtype=tf.int32)
-                    padded_attention_mask = tf.convert_to_tensor(padded_attention_mask, dtype=tf.int32)
-                    print("Padded input_ids shape:", padded_input_ids.shape)
-                    print("Padded attention_mask shape:", padded_attention_mask.shape)
                 # 动态 Padding
                 max_len_X, batch_input_ids_X, batch_attention_mask_X = dis.dynamic_padding(batch_input_ids_X, batch_attention_mask_X)
                 max_len_Y, batch_input_ids_Y, batch_attention_mask_Y = dis.dynamic_padding(batch_input_ids_Y, batch_attention_mask_Y)
-                max_len = tf.reduce_max(tf.stack([max_len_X, max_len_Y])) + 101
+                max_len = tf.reduce_max(tf.stack([max_len_X, max_len_Y])) + 11
                 print("max_len:", max_len)
-                # max_len = tf.get_static_value(max_len)
-                # print("max_len:", max_len)
 
                 batch_input_ids_X = tf.convert_to_tensor(batch_input_ids_X, dtype=tf.int32)
                 batch_attention_mask_X = tf.convert_to_tensor(batch_attention_mask_X, dtype=tf.int32)
@@ -301,28 +297,36 @@ class Train:
                 )
                 self.config.lr_step += 1
                 print(f"Train Epoch {epoch + 1} completed")
+                train_batch += 1
 
-            print(f"Valid Epoch {epoch + 1} started")
             for batch_valid_X in valid_dist_dataset_X:
-                batch_valid_ids = batch_valid_X['input_ids']
-                batch_valid_attention_mask = batch_valid_X['attention_mask']
-                batch_valid_labels = ex.create_labels(batch_valid_ids, batch_valid_attention_mask)
-                batch_valid_styles = batch_valid_X['style']
+                print(f"Valid Epoch {epoch + 1} started, batch {valid_batch + 1}")
 
+                batch_valid_ids, batch_valid_attention_mask, batch_valid_labels, batch_valid_styles = pr.get_params(batch_valid_X)
+
+                batch_valid_ids = tf.convert_to_tensor(batch_valid_ids, dtype=tf.int32)
                 batch_valid_attention_mask = tf.convert_to_tensor(batch_valid_attention_mask, dtype=tf.int32)
-                valid_loss, valid_accuracy = ex.valid_step(self.gen, 
-                                    batch_valid_ids, batch_valid_attention_mask, 
-                                    batch_valid_labels, batch_valid_styles)
+                valid_loss, valid_accuracy = ex.valid_step(
+                    self.model.gen, 
+                    self.model.embedding,
+                    batch_valid_ids, 
+                    batch_valid_attention_mask, 
+                    batch_valid_labels, 
+                    batch_valid_styles
+                )
 
                 self.update_metrics(
                     valid_loss=valid_loss,
                     valid_accuracy=valid_accuracy
                 )
+                print(f"Valid Epoch {epoch + 1} completed")
+                valid_batch += 1
 
             self.metrics['valid_perplexity'] = tf.exp(self.metrics['valid_loss'].result())
             self.print_epoch_results()
             self.append_to_config()
             print(f"Valid Epoch {epoch + 1} completed")
+            epoch += 1
 
 
     def append_to_config(self):
@@ -407,8 +411,8 @@ with mirrored_strategy.scope():
 
     train_model.train(train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, trainconfig.epochs)
 
-# 测试集评估
-test_accuracies, test_losses, test_perplexity = ex.test_evalution(generator, ex.test_step, test_tf_dataset)
+    # 测试集评估
+    test_accuracies, test_losses, test_perplexity = ex.test_evalution(generator, ex.test_step, test_tf_dataset)
 
 # 保存绘图
 save_dir = './experiment'
