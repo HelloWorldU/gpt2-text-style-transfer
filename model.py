@@ -294,11 +294,12 @@ class Trainstep:
             style_ids = tf.expand_dims(style_ids, axis=1)
             print("Max_length:", max_len)
             print("Fixed max length:", tf.get_static_value(max_len))
+
             """
             we also need to remove the leading dimension
             """
-            input_ids = tf.squeeze(input_ids, axis=0)
-            attention_mask = tf.squeeze(attention_mask, axis=0)
+            input_ids, attention_mask = pr.remove_leading_dim(input_ids, attention_mask)
+
             generated_ids = self.gen.generate(input_ids, attention_mask=attention_mask, max_length=max_len)
             print("Generated IDs shape:", generated_ids.shape)
             generated_attention_mask = tf.pad(attention_mask, [[0, 0], [0, generated_ids.shape[1] - attention_mask.shape[1]]], "CONSTANT", constant_values=1)
@@ -329,10 +330,8 @@ class Trainstep:
         """
         remove the leading dimension
         """
-        real_ids = tf.squeeze(real_ids, axis=0)
-        real_mask = tf.squeeze(real_mask, axis=0)
-        input_ids = tf.squeeze(input_ids, axis=0)
-        attention_mask = tf.squeeze(attention_mask, axis=0)
+        real_ids, real_mask = pr.remove_leading_dim(real_ids, real_mask)
+        input_ids, attention_mask = pr.remove_leading_dim(input_ids, attention_mask)
 
         generated_ids = self.gen.generate(input_ids, attention_mask=attention_mask, max_length=max_len)
         print(f"{generated_ids.shape} and {real_ids.shape} and {real_mask.shape}")
@@ -378,14 +377,12 @@ class Trainstep:
                                             style_ids_X, style_ids_Y, max_len, label_smoothing=0.1):
         style_ids_X = tf.expand_dims(style_ids_X, axis=1)
         style_ids_Y = tf.expand_dims(style_ids_Y, axis=1)
-        
+
         """
         remove the leading dimension
         """
-        input_ids_X = tf.squeeze(input_ids_X, axis=0)
-        input_ids_Y = tf.squeeze(input_ids_Y, axis=0)
-        attention_mask_X = tf.squeeze(attention_mask_X, axis=0)
-        attention_mask_Y = tf.squeeze(attention_mask_Y, axis=0)
+        input_ids_X, attention_mask_X = pr.remove_leading_dim(input_ids_X, attention_mask_X)
+        input_ids_Y, attention_mask_Y = pr.remove_leading_dim(input_ids_Y, attention_mask_Y)
 
         generated_ids_X_Z = self.gen.generate(input_ids_X, attention_mask=attention_mask_X, max_length=max_len)
         generated_ids_Y_Z = self.gen.generate(input_ids_Y, attention_mask=attention_mask_Y, max_length=max_len)
