@@ -159,7 +159,7 @@ class Trainstep:
                 actual_shape = tf.shape(input_ids)
                 print("Actual shape:", actual_shape)  # Debug info
                 
-                max_new_tokens = tf.maximum(max_len - actual_shape[1] - 10, 0)
+                max_new_tokens = tf.maximum(max_len - actual_shape[1] - 1, 0)
                 batch_size = actual_shape[0]
 
                 # 扩展 input_ids
@@ -334,7 +334,7 @@ class Trainstep:
         input_ids, attention_mask = pr.remove_leading_dim(input_ids, attention_mask)
 
         generated_ids = self.gen.generate(input_ids, attention_mask=attention_mask, max_length=max_len)
-        print(f"{generated_ids.shape} and {real_ids.shape} and {real_mask.shape}")
+        print(f"generated_ids.shape {generated_ids.shape} and real_ids.shape {real_ids.shape} and real_mask.shape {real_mask.shape}")
         with tf.GradientTape() as tape:
             real_loss = dis.compute_lm_loss(real_ids, real_mask, self.dis_Y)
             generated_mask = tf.pad(real_mask, [[0, 0], [0, generated_ids.shape[1] - real_ids.shape[1]]], "CONSTANT", constant_values=1)
@@ -350,7 +350,7 @@ class Trainstep:
     # @tf.function    
     def discriminator_Z_loss(self, zx, zy, label_smoothing=0.1):
         print(f"zx shape: {zx.shape}, zy shape: {zy.shape}")  # 调试信息
-        bce = tf.keras.losses.BinaryCrossentropy(from_logits=False, label_smoothing=label_smoothing)
+        bce = tf.keras.losses.BinaryCrossentropy(from_logits=False, label_smoothing=label_smoothing, reduction='none')
         zx = self.gen.transformer.wte(zx) # [batch_size, seq_len, n_embd]
         zy = self.dis_Y.transformer.wte(zy) # [batch_size, seq_len, n_embd]
         print(f"zx shape: {zx.shape}, zy shape: {zy.shape}")  # 调试信息
@@ -364,7 +364,7 @@ class Trainstep:
     def train_discriminator_Z_step(self, zx, zy, label_smoothing=0.1):
         zx = tf.pad(zx, [[0, 0], [0, zy.shape[1] - zx.shape[1]]], "CONSTANT", constant_values=0)
         with tf.GradientTape() as tape:
-            loss = self.discriminator_Z_loss(self.dis_Z, zx, zy, label_smoothing=label_smoothing)
+            loss = self.discriminator_Z_loss(zx, zy, label_smoothing=label_smoothing)
         gradients = tape.gradient(loss, self.dis_Z.trainable_variables)
         print("Discriminator Z gradients calculated")  # Debug info
         self.dis_Z_optimizer.apply_gradients(zip(gradients, self.dis_Z.trainable_variables))
@@ -386,7 +386,7 @@ class Trainstep:
 
         generated_ids_X_Z = self.gen.generate(input_ids_X, attention_mask=attention_mask_X, max_length=max_len)
         generated_ids_Y_Z = self.gen.generate(input_ids_Y, attention_mask=attention_mask_Y, max_length=max_len)
-        disc_z_loss_X = self.train_discriminator_Y_step(self.dis_Z, input_ids_X, generated_ids_X_Z, self.dis_z_optimizer, label_smoothing=label_smoothing)
-        disc_z_loss_Y = self.train_discriminator_Y_step(self.dis_Z, input_ids_Y, generated_ids_Y_Z, self.dis_z_optimizer, label_smoothing=label_smoothing)
+        disc_z_loss_X = self.train_discriminator_Z_step(input_ids_X, generated_ids_X_Z, label_smoothing=label_smoothing)
+        disc_z_loss_Y = self.train_discriminator_Z_step(input_ids_Y, generated_ids_Y_Z, label_smoothing=label_smoothing)
         return disc_z_loss_X, disc_z_loss_Y
 
