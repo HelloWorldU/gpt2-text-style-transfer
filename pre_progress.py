@@ -43,7 +43,7 @@ def set_seed(seed=42) -> tuple:
 @dataclass
 class TrainConfig:
     epochs: int = 10
-    batch_size: int = 8
+    batch_size: int = 4
     max_len: int = 0
     accumulation_steps: int = 2
     lambda_rec: float = 1.0
@@ -76,7 +76,6 @@ def load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, split_rati
     def read_and_tokenize(file_path, style):
         with tf.io.gfile.GFile(file_path, 'r') as f:
             lines = f.read().splitlines()
-        random.shuffle(lines)
         split = int(len(lines) * split_ratio)
         train_lines = lines[:split]
         valid_lines = lines[split:]
@@ -111,18 +110,24 @@ def load_dataset(file_path_X, file_path_Y, test_file_path, tokenizer, split_rati
 
     return (train_dataset_X, train_dataset_Y, valid_dataset_X, valid_dataset_Y, test_dataset)
 
-def create_labels(input_ids, attention_mask):
-    max_len = tf.reduce_max(tf.map_fn(lambda x: tf.shape(x)[0], input_ids, dtype=tf.int32))
 
-    input_ids = tf.keras.preprocessing.sequence.pad_sequences(input_ids, maxlen=max_len, padding='post')
-    attention_mask = tf.keras.preprocessing.sequence.pad_sequences(attention_mask, maxlen=max_len, padding='post')
-    
-    labels = tf.roll(input_ids, shift=-1, axis=1)
-    labels = tf.where(attention_mask == 0, -100, labels)
-    return labels
+@tf.function
+def create_labels(input_ids, attention_mask):
+    strategy = tf.distribute.get_strategy()
+
+    @tf.function
+    def step_fn(input_ids, attention_mask):
+        max_len = tf.reduce_max(tf.map_fn(lambda x: tf.shape(x)[0], input_ids, fn_output_signature=tf.TensorSpec(shape=(), dtype=tf.int32)))
+        input_ids = tf.pad(input_ids, [[0, 0], [0, max_len - tf.shape(input_ids)[1]]])
+        attention_mask = tf.pad(attention_mask, [[0, 0], [0, max_len - tf.shape(attention_mask)[1]]])
+        labels = tf.roll(input_ids, shift=-1, axis=1)
+        labels = tf.where(attention_mask == 0, -100, labels)
+        return labels
+
+    return strategy.run(step_fn, args=(input_ids, attention_mask))
 
 # 创建数据集
-def create_tf_dataset(dataset, batch_size, drop_remainder=True, shuffle=True, shuffle_buffer_size=10000):
+def create_tf_dataset(dataset, batch_size, drop_remainder=True, shuffle=False, shuffle_buffer_size=10000):
     input_ids, attention_mask, styles = dataset
     
     def gen():
@@ -162,15 +167,35 @@ def create_tf_dataset(dataset, batch_size, drop_remainder=True, shuffle=True, sh
     Setting up an auto-sharding policy to automatically slice the dataset during distributed training.
     """
     options = tf.data.Options()
-    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
-    tf_dataset = tf_dataset.with_options(options)    
+    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.AUTO
+    tf_dataset = tf_dataset.with_options(options)
+
+    tf_dataset = tf_dataset.prefetch(tf.data.AUTOTUNE)
 
     return tf_dataset
 
 
 # 张量转换
-def conv_tensor_to_int(**kwargs):
-    for key, value in kwargs.items():
-        if isinstance(value, tf.Tensor):
-            kwargs[key] = tf.cast(value, tf.float32)
-    return kwargs
+def conv_tensor_to_float(*args):
+    for arg in args:
+        if isinstance(arg, tf.Tensor):
+            arg = tf.cast(arg, tf.float32)
+    return args
+
+
+# 获取参数
+@tf.function
+def get_params(batch_X):
+    input_ids = batch_X['input_ids']
+    attention_mask = batch_X['attention_mask']
+    labels = create_labels(input_ids, attention_mask)
+    style = batch_X['style']
+    return input_ids, attention_mask, labels, style
+
+
+# 移除前导维数
+@tf.function
+def remove_leading_dim(input_ids, attention_mask):
+    input_ids = tf.squeeze(input_ids, axis=0)
+    attention_mask = tf.squeeze(attention_mask, axis=0)
+    return input_ids, attention_mask
