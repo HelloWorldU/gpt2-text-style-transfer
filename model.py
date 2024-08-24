@@ -85,24 +85,25 @@ accumulated_gradients = None
 in this task, we only trained X->Y.
 """
 class Trainstep:
-    def __init__(self, gen, gen_optimizer, dis_Y, dis_Y_optimizer, dis_Z, dis_Z_optimizer, tokenizer, strategy):
+    def __init__(self, gen, gen_optimizer, dis_Y, dis_Y_optimizer, dis_Z, dis_Z_optimizer, tokenizer, embedding, strategy, final_lr_schedule):
         self.strategy = strategy
-        with self.strategy.scope():
-            self.gen = gen
-            self.gen_optimizer = gen_optimizer
-            self.dis_Y = dis_Y
-            self.dis_Y_optimizer = dis_Y_optimizer
-            self.dis_Z = dis_Z
-            self.dis_Z_optimizer = dis_Z_optimizer
-            self.tokenizer = tokenizer
+        self.gen = gen
+        self.gen_optimizer = gen_optimizer
+        self.dis_Y = dis_Y
+        self.dis_Y_optimizer = dis_Y_optimizer
+        self.dis_Z = dis_Z
+        self.dis_Z_optimizer = dis_Z_optimizer
+        self.tokenizer = tokenizer
+        self.embedding = embedding
+        self.final_lr_schedule = final_lr_schedule
 
 
-    @tf.function
-    def train_generator_step(self, input_ids, attention_mask, labels, styles, max_len, step, final_lr_schedule, 
-                        mymodel, accumulation_steps=4, lambda_rec=1.0, lambda_lm=1.0, lambda_adv=1.0, lambda_kl=1.0, gamma=1.0): 
+    # @tf.function
+    def train_generator_step(self, input_ids, attention_mask, labels, styles, max_len, step, accumulation_steps=4, 
+                             lambda_rec=1.0, lambda_lm=1.0, lambda_adv=1.0, lambda_kl=1.0, gamma=1.0): 
         global accumulated_gradients
         def step_fn(input_ids=input_ids, attention_mask=attention_mask, labels=labels, styles=styles, max_len=max_len, 
-            accumulation_steps=accumulation_steps, lambda_rec=lambda_rec, lambda_lm=lambda_lm, lambda_adv=lambda_adv, lambda_kl=lambda_kl, gamma=gamma):
+        accumulation_steps=accumulation_steps, lambda_rec=lambda_rec, lambda_lm=lambda_lm, lambda_adv=lambda_adv, lambda_kl=lambda_kl, gamma=gamma):
             with tf.GradientTape() as tape:
                 tf.debugging.enable_check_numerics()
                 
@@ -111,17 +112,22 @@ class Trainstep:
                 epsilon = 1e-6 # 快速修复
 
                 # 嵌入风格标签
-                style_embeddings = mymodel(styles)
+                style_embeddings = self.embedding(styles) # [num_devices, batch_size, n_embd]
                 print("Style embeddings shape:", style_embeddings.shape)  # Debug info
                 
                 # 将输入 ID 嵌入到相同的嵌入空间
-                input_embeddings = self.gen.transformer.wte(input_ids) # [batch_size, seq_len, n_embd]
+                input_embeddings = self.gen.transformer.wte(input_ids) # [num_devices, batch_size, seq_len, n_embd]
                 print("Input embeddings shape:", input_embeddings.shape)  # Debug info
                 
                 extended_input_embeddings = input_embeddings + tf.expand_dims(style_embeddings, axis=1)
                 print("Extended embeddings shape:", extended_input_embeddings.shape)  # Debug info
 
+                """
+                at here, we need to remove the leading dimension
+                """
+                extended_input_embeddings = tf.squeeze(extended_input_embeddings, axis=0)
                 input_ids, attention_mask, labels, styles = dis.convert_tensor(input_ids, attention_mask, labels, styles)
+                input_ids, attention_mask = pr.remove_leading_dim(input_ids, attention_mask)
 
                 outputs = self.gen(input_ids=input_ids, attention_mask=attention_mask, training=True)
                 logits = outputs.logits
@@ -150,14 +156,22 @@ class Trainstep:
                         "styles:", styles.shape,
                         "max_len:", max_len)
 
-                max_new_tokens = max_len - input_ids.shape[1] - 10
-                batch_size = input_ids.shape[0]
+                actual_shape = tf.shape(input_ids)
+                print("Actual shape:", actual_shape)  # Debug info
+                
+                max_new_tokens = tf.maximum(max_len - actual_shape[1] - 10, 0)
+                batch_size = actual_shape[0]
 
                 # 扩展 input_ids
+                """
+                at here, we need to padding to -> [batch_size, max_new_tokens]
+                """
                 padding = tf.zeros((batch_size, max_new_tokens), dtype=input_ids.dtype)
+                print("Padding shape:", padding.shape)  # Debug info
+                
                 extended_input_ids = tf.concat([input_ids, padding], axis=1)
                 extended_attention_mask1 = tf.concat([attention_mask, tf.zeros((attention_mask.shape[0],
-                        max_new_tokens), dtype=attention_mask.dtype)], axis=1)
+                                            max_new_tokens), dtype=attention_mask.dtype)], axis=1)
                 
                 print(f"Extended input_ids shape: {extended_input_ids.shape}")
                 print(f"Extended attention_mask shape: {extended_attention_mask1.shape}")
@@ -256,7 +270,7 @@ class Trainstep:
             accumulated_gradients[i].assign(g / tf.cast(accumulation_steps, g.dtype))
         self.gen_optimizer.apply_gradients(zip(accumulated_gradients, self.gen.trainable_variables))
         print("Gradients applied")  # Debug info
-        current_lr = final_lr_schedule(step)
+        current_lr = self.final_lr_schedule(step)
         
         for grad in accumulated_gradients:
             grad.assign(tf.zeros_like(grad))
@@ -270,85 +284,112 @@ class Trainstep:
                 total_accuracy / tf.cast(accumulation_steps, tf.float32))
 
 
-# REINFORCE算法
-@tf.function
-def reinforce_step(input_ids, attention_mask, labels, style_ids, max_len, gen, language_model, gen_optimizer):
-    with tf.GradientTape() as tape:
-        print("input_ids shape:", input_ids.shape)
-        print("attention_mask shape:", attention_mask.shape)
-        print("style_ids shape:", style_ids.shape)
-        style_ids = tf.expand_dims(style_ids, axis=1)
-        print("Fixed max_length:", max_len)
-        generated_ids = gen.generate(input_ids, attention_mask=attention_mask, max_length=max_len)
-        generated_attention_mask = tf.pad(attention_mask, [[0, 0], [0, generated_ids.shape[1] - attention_mask.shape[1]]], "CONSTANT", constant_values=1)
-        lm_loss = dis.compute_lm_loss(generated_ids, generated_attention_mask, language_model)
+    # REINFORCE算法
+    # @tf.function
+    def reinforce_step(self, input_ids, attention_mask, labels, style_ids, max_len):
+        with tf.GradientTape() as tape:
+            print("input_ids shape:", input_ids.shape)
+            print("attention_mask shape:", attention_mask.shape)
+            print("style_ids shape:", style_ids.shape)
+            style_ids = tf.expand_dims(style_ids, axis=1)
+            print("Max_length:", max_len)
+            print("Fixed max length:", tf.get_static_value(max_len))
+            """
+            we also need to remove the leading dimension
+            """
+            input_ids = tf.squeeze(input_ids, axis=0)
+            attention_mask = tf.squeeze(attention_mask, axis=0)
+            generated_ids = self.gen.generate(input_ids, attention_mask=attention_mask, max_length=max_len)
+            print("Generated IDs shape:", generated_ids.shape)
+            generated_attention_mask = tf.pad(attention_mask, [[0, 0], [0, generated_ids.shape[1] - attention_mask.shape[1]]], "CONSTANT", constant_values=1)
+            lm_loss = dis.compute_lm_loss(generated_ids, generated_attention_mask, self.dis_Y)
+            
+            outputs = self.gen(input_ids, attention_mask=attention_mask, labels=labels, training=False)
+            logits = outputs.logits
+            log_probs = tf.nn.log_softmax(logits, axis=-1)
+            seq_len = tf.shape(generated_ids)[1]
+            mask = tf.sequence_mask(tf.reduce_sum(tf.cast(generated_ids != self.gen.config.pad_token_id, tf.int32), axis=1), maxlen=seq_len)
+            log_probs_padded = tf.pad(log_probs, [[0, 0], [0, tf.shape(mask)[1] - tf.shape(log_probs)[1]], [0, 0]], "CONSTANT", constant_values=0)
+            masked_log_probs = tf.cast(log_probs_padded, tf.float32) * tf.cast(mask[:, :, tf.newaxis], tf.float32)
+            log_prob = tf.reduce_mean(masked_log_probs) / tf.reduce_sum(tf.cast(mask, tf.float32))
+            
+            # 添加基线
+            baseline = tf.reduce_mean(lm_loss)
+            advantage = lm_loss - baseline
+            loss = -tf.cast(advantage, tf.float32) * log_prob
+        gradients = tape.gradient(loss, self.gen.trainable_variables)
+        print("reinforce gradients calculated")  # Debug info
+        self.gen_optimizer.apply_gradients(zip(gradients, self.gen.trainable_variables))
+        return loss
+
+
+    # 自定义鉴别器训练步骤
+    # @tf.function
+    def train_discriminator_Y_step(self, real_ids, real_mask, input_ids, attention_mask, max_len, gamma=1.0):
+        """
+        remove the leading dimension
+        """
+        real_ids = tf.squeeze(real_ids, axis=0)
+        real_mask = tf.squeeze(real_mask, axis=0)
+        input_ids = tf.squeeze(input_ids, axis=0)
+        attention_mask = tf.squeeze(attention_mask, axis=0)
+
+        generated_ids = self.gen.generate(input_ids, attention_mask=attention_mask, max_length=max_len)
+        print(f"{generated_ids.shape} and {real_ids.shape} and {real_mask.shape}")
+        with tf.GradientTape() as tape:
+            real_loss = dis.compute_lm_loss(real_ids, real_mask, self.dis_Y)
+            generated_mask = tf.pad(real_mask, [[0, 0], [0, generated_ids.shape[1] - real_ids.shape[1]]], "CONSTANT", constant_values=1)
+            fake_loss = dis.compute_lm_loss(generated_ids, generated_mask, self.dis_Y)
+            total_loss = real_loss - gamma * fake_loss
+        gradients = tape.gradient(total_loss, self.dis_Y.trainable_variables)
+        print("dis_Y gradients calculated")  # Debug info
+        self.dis_Y_optimizer.apply_gradients(zip(gradients, self.dis_Y.trainable_variables))
+        return total_loss, real_loss, fake_loss
+
+
+    # 鉴别器z对齐
+    # @tf.function    
+    def discriminator_Z_loss(self, zx, zy, label_smoothing=0.1):
+        print(f"zx shape: {zx.shape}, zy shape: {zy.shape}")  # 调试信息
+        bce = tf.keras.losses.BinaryCrossentropy(from_logits=False, label_smoothing=label_smoothing)
+        zx = self.gen.transformer.wte(zx) # [batch_size, seq_len, n_embd]
+        zy = self.dis_Y.transformer.wte(zy) # [batch_size, seq_len, n_embd]
+        print(f"zx shape: {zx.shape}, zy shape: {zy.shape}")  # 调试信息
+        zx_loss = bce(tf.ones_like(self.dis_Z(zx)), self.dis_Z(zx))
+        zy_loss = bce(tf.zeros_like(self.dis_Z(zy)), self.dis_Z(zy))
+        print("Discriminator Z loss calculated")  # 调试信息
+        return zx_loss + zy_loss
+
+    # 训练鉴别器z
+    # @tf.function
+    def train_discriminator_Z_step(self, zx, zy, label_smoothing=0.1):
+        zx = tf.pad(zx, [[0, 0], [0, zy.shape[1] - zx.shape[1]]], "CONSTANT", constant_values=0)
+        with tf.GradientTape() as tape:
+            loss = self.discriminator_Z_loss(self.dis_Z, zx, zy, label_smoothing=label_smoothing)
+        gradients = tape.gradient(loss, self.dis_Z.trainable_variables)
+        print("Discriminator Z gradients calculated")  # Debug info
+        self.dis_Z_optimizer.apply_gradients(zip(gradients, self.dis_Z.trainable_variables))
+        return loss
+
+
+    # 生成样本训练鉴别器z
+    # @tf.function
+    def train_generator_with_discriminator_Z(self, input_ids_X, input_ids_Y, attention_mask_X, attention_mask_Y, 
+                                            style_ids_X, style_ids_Y, max_len, label_smoothing=0.1):
+        style_ids_X = tf.expand_dims(style_ids_X, axis=1)
+        style_ids_Y = tf.expand_dims(style_ids_Y, axis=1)
         
-        outputs = gen(input_ids, attention_mask=attention_mask, labels=labels, training=False)
-        logits = outputs.logits
-        log_probs = tf.nn.log_softmax(logits, axis=-1)
-        seq_len = tf.shape(generated_ids)[1]
-        mask = tf.sequence_mask(tf.reduce_sum(tf.cast(generated_ids != gen.config.pad_token_id, tf.int32), axis=1), maxlen=seq_len)
-        log_probs_padded = tf.pad(log_probs, [[0, 0], [0, tf.shape(mask)[1] - tf.shape(log_probs)[1]], [0, 0]], "CONSTANT", constant_values=0)
-        masked_log_probs = tf.cast(log_probs_padded, tf.float32) * tf.cast(mask[:, :, tf.newaxis], tf.float32)
-        log_prob = tf.reduce_mean(masked_log_probs) / tf.reduce_sum(tf.cast(mask, tf.float32))
-        
-        # 添加基线
-        baseline = tf.reduce_mean(lm_loss)
-        advantage = lm_loss - baseline
-        loss = -tf.cast(advantage, tf.float32) * log_prob
-    gradients = tape.gradient(loss, gen.trainable_variables)
-    print("reinforce gradients calculated")  # Debug info
-    gen_optimizer.apply_gradients(zip(gradients, gen.trainable_variables))
-    return loss
+        """
+        remove the leading dimension
+        """
+        input_ids_X = tf.squeeze(input_ids_X, axis=0)
+        input_ids_Y = tf.squeeze(input_ids_Y, axis=0)
+        attention_mask_X = tf.squeeze(attention_mask_X, axis=0)
+        attention_mask_Y = tf.squeeze(attention_mask_Y, axis=0)
 
-
-# 自定义鉴别器训练步骤
-@tf.function
-def train_discriminator_Y_step(real_ids, real_mask, generated_ids, model, optimizer, gamma=1.0):
-    print(f"{generated_ids.shape} and {real_ids.shape} and {real_mask.shape}")
-    with tf.GradientTape() as tape:
-        real_loss = dis.compute_lm_loss(real_ids, real_mask, model)
-        generated_mask = tf.pad(real_mask, [[0, 0], [0, generated_ids.shape[1] - real_ids.shape[1]]], "CONSTANT", constant_values=1)
-        fake_loss = dis.compute_lm_loss(generated_ids, generated_mask, model)
-        total_loss = real_loss - gamma * fake_loss
-    gradients = tape.gradient(total_loss, model.trainable_variables)
-    print("dis_Y gradients calculated")  # Debug info
-    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-    return total_loss, real_loss, fake_loss
-
-
-# 鉴别器z对齐
-def discriminator_Z_loss(gen, dis_Y, dis_Z, zx, zy, label_smoothing=0.1):
-    print(f"zx shape: {zx.shape}, zy shape: {zy.shape}")  # 调试信息
-    bce = tf.keras.losses.BinaryCrossentropy(from_logits=False, label_smoothing=label_smoothing)
-    zx = gen.transformer.wte(zx) # [batch_size, seq_len, n_embd]
-    zy = dis_Y.transformer.wte(zy) # [batch_size, seq_len, n_embd]
-    print(f"zx shape: {zx.shape}, zy shape: {zy.shape}")  # 调试信息
-    zx_loss = bce(tf.ones_like(dis_Z(zx)), dis_Z(zx))
-    zy_loss = bce(tf.zeros_like(dis_Z(zy)), dis_Z(zy))
-    print("Discriminator Z loss calculated")  # 调试信息
-    return zx_loss + zy_loss
-
-# 训练鉴别器z
-@tf.function
-def train_discriminator_Z_step(dis_Z, zx, zy, optimizer, label_smoothing):
-    zx = tf.pad(zx, [[0, 0], [0, zy.shape[1] - zx.shape[1]]], "CONSTANT", constant_values=0)
-    with tf.GradientTape() as tape:
-        loss = discriminator_Z_loss(dis_Z, zx, zy, label_smoothing=label_smoothing)
-    gradients = tape.gradient(loss, dis_Z.trainable_variables)
-    print("Discriminator Z gradients calculated")  # Debug info
-    optimizer.apply_gradients(zip(gradients, dis_Z.trainable_variables))
-    return loss
-
-
-# 生成样本训练鉴别器z
-def train_generator_with_discriminator_Z(gen, dis_Z, input_ids_X, input_ids_Y, attention_mask_X, attention_mask_Y, 
-                                         style_ids_X, style_ids_Y, max_len, gen_optimizer, dis_z_optimizer, label_smoothing=0.1):
-    style_ids_X = tf.expand_dims(style_ids_X, axis=1)
-    style_ids_Y = tf.expand_dims(style_ids_Y, axis=1)
-    generated_ids_X_Z = gen.generate(input_ids_X, attention_mask=attention_mask_X, max_length=max_len)
-    generated_ids_Y_Z = gen.generate(input_ids_Y, attention_mask=attention_mask_Y, max_length=max_len)
-    disc_z_loss_X = train_discriminator_Y_step(dis_Z, input_ids_X, generated_ids_X_Z, dis_z_optimizer, label_smoothing=label_smoothing)
-    disc_z_loss_Y = train_discriminator_Y_step(dis_Z, input_ids_Y, generated_ids_Y_Z, dis_z_optimizer, label_smoothing=label_smoothing)
-    return disc_z_loss_X, disc_z_loss_Y
+        generated_ids_X_Z = self.gen.generate(input_ids_X, attention_mask=attention_mask_X, max_length=max_len)
+        generated_ids_Y_Z = self.gen.generate(input_ids_Y, attention_mask=attention_mask_Y, max_length=max_len)
+        disc_z_loss_X = self.train_discriminator_Y_step(self.dis_Z, input_ids_X, generated_ids_X_Z, self.dis_z_optimizer, label_smoothing=label_smoothing)
+        disc_z_loss_Y = self.train_discriminator_Y_step(self.dis_Z, input_ids_Y, generated_ids_Y_Z, self.dis_z_optimizer, label_smoothing=label_smoothing)
+        return disc_z_loss_X, disc_z_loss_Y
 
