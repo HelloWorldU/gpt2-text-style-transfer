@@ -6,6 +6,7 @@ import experiment as ex
 import discriminator as dis
 import pre_progress as pr
 import model as md
+import numpy as np
 import logging
 import datetime
 
@@ -86,22 +87,29 @@ class Train:
     def setup_metrics(self):
         metric_names = ['train_loss', 'train_accuracy', 'rec_loss', 'lm_loss', 'adv_loss', 
                         'kl_loss', 'disc_y_loss', 'disc_z_loss', 'reinforce_loss', 
-                        'valid_loss', 'valid_accuracy', 'perplexity', 'learning_rate']
+                        'valid_loss', 'valid_accuracy', 'valid_perplexity']
         self.metrics = {name: tf.keras.metrics.Mean(name=name) for name in metric_names}
 
 
     def update_metrics(self, **kwargs) -> None:
         for name, value in kwargs.items():
             if name in self.metrics:
-                self.metrics[name].update_state(value)
-
+                if isinstance(value, tf.Tensor):
+                    value = value.numpy()  
+                if np.isscalar(value):  
+                    self.metrics[name].update_state(value)
+                else:
+                    raise ValueError(f"Expected scalar value for metric '{name}', but got {type(value)}")
+                
 
     def reset_metrics(self):
         for metric in self.metrics.values():
-            metric.reset_states()
+            if isinstance(metric, tf.keras.metrics.Metric):
+                metric.reset_states()
+            else:
+                raise TypeError(f"Expected a tf.keras.metrics.Metric instance, but got {type(metric)}")
 
 
-    # @tf.function 
     def distributed_train_generator_step(self, batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X, *args, **kwargs):
         new_args = []
         for arg in args:
@@ -122,12 +130,10 @@ class Train:
             args=(batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X, *new_args), 
             kwargs=new_kwargs
         )
-        total_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, loss, axis=None)
+        total_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, loss, axis=None)
         return loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy, total_loss
 
 
-
-    # @tf.function
     def distributed_train_reinforce_step(self, *args, **kwargs):
         new_args = []
         for arg in args:
@@ -143,10 +149,9 @@ class Train:
                 new_kwargs[key] = tf.convert_to_tensor(value)
 
         reinforce_loss = self.strategy.run(self.model.reinforce_step, args=(new_args), kwargs=new_kwargs)
-        return self.strategy.reduce(tf.distribute.ReduceOp.SUM, reinforce_loss, axis=None)
+        return self.strategy.reduce(tf.distribute.ReduceOp.MEAN, reinforce_loss, axis=None)
 
 
-    # @tf.function
     def distributed_train_discriminator_Y_step(self, *args, **kwargs):
         new_args = []
         for arg in args:
@@ -162,11 +167,10 @@ class Train:
                 new_kwargs[key] = tf.convert_to_tensor(value)
 
         disc_loss_Y, real_loss_Y, fake_loss_Y = self.strategy.run(self.model.train_discriminator_Y_step, args=(*new_args,), kwargs=new_kwargs)
-        total_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, disc_loss_Y, axis=None)
+        total_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, disc_loss_Y, axis=None)
         return disc_loss_Y, real_loss_Y, fake_loss_Y, total_loss
 
 
-    # @tf.function
     def distributed_train_discriminator_Z_step(self, *args, **kwargs):
         new_args = []
         for arg in args:
@@ -182,7 +186,7 @@ class Train:
                 new_kwargs[key] = tf.convert_to_tensor(value)
 
         disc_z_loss_X, disc_z_loss_Y = self.strategy.run(self.model.train_generator_with_discriminator_Z, args=new_args, kwargs=new_kwargs)
-        total_Z_loss = self.strategy.reduce(tf.distribute.ReduceOp.SUM, (disc_z_loss_X + disc_z_loss_Y) / 2.0, axis=None)
+        total_Z_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, (disc_z_loss_X + disc_z_loss_Y) / 2.0, axis=None)
         return disc_z_loss_X, disc_z_loss_Y, total_Z_loss
     
 
@@ -206,19 +210,11 @@ class Train:
 
                 batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X = pr.get_params(batch_X)
                 batch_input_ids_Y, batch_attention_mask_Y, batch_labels_Y, batch_styles_Y = pr.get_params(batch_Y)
+               
                 """
                 we got the PerReplica object from the dataset
                 """
                 print("Processing batch")
-
-                # for element in train_tf_dataset_X.take(1):
-                #     max_len, padded_input_ids, padded_attention_mask = dis.dynamic_padding(
-                #         element['input_ids'], element['attention_mask']
-                #     )
-                #     padded_input_ids = tf.convert_to_tensor(padded_input_ids, dtype=tf.int32)
-                #     padded_attention_mask = tf.convert_to_tensor(padded_attention_mask, dtype=tf.int32)
-                #     print("Padded input_ids shape:", padded_input_ids.shape)
-                #     print("Padded attention_mask shape:", padded_attention_mask.shape)
 
                 # 动态 Padding
                 max_len_X, batch_input_ids_X, batch_attention_mask_X = dis.dynamic_padding(batch_input_ids_X, batch_attention_mask_X)
@@ -293,11 +289,11 @@ class Train:
                     disc_y_loss=total__Y_loss,
                     disc_z_loss=total_Z_loss,
                     reinforce_loss=reinforce_loss,
-                    learning_rate=current_lr
                 )
                 self.config.lr_step += 1
                 print(f"Train Epoch {epoch + 1} completed")
                 train_batch += 1
+                self.append_to_config_lr(current_lr)
 
             for batch_valid_X in valid_dist_dataset_X:
                 print(f"Valid Epoch {epoch + 1} started, batch {valid_batch + 1}")
@@ -306,6 +302,9 @@ class Train:
 
                 batch_valid_ids = tf.convert_to_tensor(batch_valid_ids, dtype=tf.int32)
                 batch_valid_attention_mask = tf.convert_to_tensor(batch_valid_attention_mask, dtype=tf.int32)
+                print("batch_valid_ids shape:", tf.shape(batch_valid_ids))
+                print("batch_valid_attention_mask shape:", tf.shape(batch_valid_attention_mask))
+
                 valid_loss, valid_accuracy = ex.valid_step(
                     self.model.gen, 
                     self.model.embedding,
@@ -322,10 +321,11 @@ class Train:
                 print(f"Valid Epoch {epoch + 1} completed")
                 valid_batch += 1
 
-            self.metrics['valid_perplexity'] = tf.exp(self.metrics['valid_loss'].result())
+            perplexity = tf.exp(self.metrics['valid_loss'].result())
+            self.metrics['valid_perplexity'].update_state(perplexity)
             self.print_epoch_results()
             self.append_to_config()
-            print(f"Valid Epoch {epoch + 1} completed")
+            print(f"Epoch {epoch + 1} completed")
             epoch += 1
 
 
@@ -336,17 +336,31 @@ class Train:
         self.config.lm_losses.append(self.metrics['lm_loss'].result().numpy())
         self.config.adv_losses.append(self.metrics['adv_loss'].result().numpy())
         self.config.kl_losses.append(self.metrics['kl_loss'].result().numpy())
-        self.config.disc_losses.append(self.metrics['disc_y_loss'].result().numpy())
+        self.config.disc_y_losses.append(self.metrics['disc_y_loss'].result().numpy())
         self.config.disc_z_losses.append(self.metrics['disc_z_loss'].result().numpy())
         self.config.reinforce_losses.append(self.metrics['reinforce_loss'].result().numpy())
         self.config.valid_losses.append(self.metrics['valid_loss'].result().numpy())
         self.config.valid_accuracies.append(self.metrics['valid_accuracy'].result().numpy())
         self.config.perplexities.append(self.metrics['valid_perplexity'].result().numpy())
-        self.config.learning_rates.append(self.metrics['current_lr'].result().numpy())
+    
+
+    def append_to_config_lr(self, current_lr):
+        if not isinstance(current_lr, float):
+            current_lr = current_lr.numpy()
+        self.config.learning_rates.append(current_lr)
 
 
     def print_epoch_results(self):
-        template = ''.join(f"{key}: {metric.result().numpy()}" for key, metric in self.metrics.items())
+        def format_metric(metric):
+            if hasattr(metric, 'result'):
+                return metric.result().numpy()
+            elif isinstance(metric, tf.Tensor):
+                return metric.numpy()
+            elif np.isscalar(metric):
+                return metric
+            else:
+                return str(metric)
+        template = ''.join(f"{key}: {format_metric(self.metrics[key])}\n" for key in self.metrics)
         print(template)
 
 
@@ -364,7 +378,7 @@ import json
 
 # communication_options = tf.distribute.experimental.CommunicationOptions(implementation=tf.distribute.experimental.CommunicationImplementation.NCCL)
 # mirrored_strategy = tf.distribute.MirroredStrategy()
-mirrored_strategy = tf.distribute.OneDeviceStrategy(device="/gpu:0")
+mirrored_strategy = tf.distribute.MirroredStrategy()
 
 with mirrored_strategy.scope():
     generator, discriminator_Y, discriminator_Z, tokenizer = md.create_model()
@@ -418,12 +432,12 @@ with mirrored_strategy.scope():
 save_dir = './experiment'
 if not os.path.exists(save_dir):
     os.makedirs(save_dir)
-ex.perplexity_curve(train_model.cfg.perplexities, save_dir)
-ex.loss_curve(train_model.cfg.train_losses, train_model.cfg.valid_losses, save_dir)
-ex.accuracy_curve(train_model.cfg.train_accuracies, train_model.cfg.valid_accuracies, save_dir)
-ex.learning_rate_curve(train_model.cfg.learning_rates, save_dir)
-ex.plot_losses(train_model.cfg.rec_losses, train_model.cfg.lm_losses, train_model.cfg.adv_losses,
-                train_model.cfg.kl_losses, train_model.cfg.disc_losses, train_model.cfg.disc_z_losses, save_dir)
+ex.perplexity_curve(train_model.config.perplexities, save_dir)
+ex.loss_curve(train_model.config.train_losses, train_model.config.valid_losses, save_dir)
+ex.accuracy_curve(train_model.config.train_accuracies, train_model.config.valid_accuracies, save_dir)
+ex.learning_rate_curve(train_model.config.learning_rates, save_dir)
+ex.plot_losses(train_model.config.rec_losses, train_model.config.lm_losses, train_model.config.adv_losses,
+                train_model.config.kl_losses, train_model.config.disc_y_losses, train_model.config.disc_z_losses, save_dir)
 
 # 保存模型和分词器
 generator.save_pretrained('./model/generator')
