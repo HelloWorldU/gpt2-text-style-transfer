@@ -102,6 +102,7 @@ class Trainstep:
     def train_generator_step(self, input_ids, attention_mask, labels, styles, max_len, step, accumulation_steps=4, 
                              lambda_rec=1.0, lambda_lm=1.0, lambda_adv=1.0, lambda_kl=1.0, gamma=1.0): 
         global accumulated_gradients
+        # @tf.function
         def step_fn(input_ids=input_ids, attention_mask=attention_mask, labels=labels, styles=styles, max_len=max_len, 
         accumulation_steps=accumulation_steps, lambda_rec=lambda_rec, lambda_lm=lambda_lm, lambda_adv=lambda_adv, lambda_kl=lambda_kl, gamma=gamma):
             with tf.GradientTape() as tape:
@@ -111,23 +112,31 @@ class Trainstep:
 
                 epsilon = 1e-6 # 快速修复
 
+                """
+                we firstly to reshape the input
+                """
+                actual_shape = tf.shape(input_ids)
+                input_ids = tf.reshape(input_ids, (actual_shape[0] * actual_shape[1], actual_shape[2]))
+                attention_mask = tf.reshape(attention_mask, (actual_shape[0] * actual_shape[1], actual_shape[2]))
+
+                """
+                then, we repeat styles and labels
+                """
+                styles = tf.repeat(styles, repeats=actual_shape[0])
+                labels = tf.repeat(labels, repeats=actual_shape[0], axis=0)
+
                 # 嵌入风格标签
-                style_embeddings = self.embedding(styles) # [num_devices, batch_size, n_embd]
+                style_embeddings = self.embedding(styles) # [num_devices * batch_size, n_embd]
                 print("Style embeddings shape:", style_embeddings.shape)  # Debug info
                 
                 # 将输入 ID 嵌入到相同的嵌入空间
-                input_embeddings = self.gen.transformer.wte(input_ids) # [num_devices, batch_size, seq_len, n_embd]
+                input_embeddings = self.gen.transformer.wte(input_ids) # [num_devices * batch_size, seq_len, n_embd]
                 print("Input embeddings shape:", input_embeddings.shape)  # Debug info
                 
                 extended_input_embeddings = input_embeddings + tf.expand_dims(style_embeddings, axis=1)
                 print("Extended embeddings shape:", extended_input_embeddings.shape)  # Debug info
 
-                """
-                at here, we need to remove the leading dimension
-                """
-                extended_input_embeddings = tf.squeeze(extended_input_embeddings, axis=0)
                 input_ids, attention_mask, labels, styles = dis.convert_tensor(input_ids, attention_mask, labels, styles)
-                input_ids, attention_mask = pr.remove_leading_dim(input_ids, attention_mask)
 
                 outputs = self.gen(input_ids=input_ids, attention_mask=attention_mask, training=True)
                 logits = outputs.logits
@@ -156,11 +165,11 @@ class Trainstep:
                         "styles:", styles.shape,
                         "max_len:", max_len)
 
-                actual_shape = tf.shape(input_ids)
-                print("Actual shape:", actual_shape)  # Debug info
+                new_shape = tf.shape(input_ids)
+                print("Actual shape:", new_shape)  # Debug info
                 
-                max_new_tokens = tf.maximum(max_len - actual_shape[1] - 1, 0)
-                batch_size = actual_shape[0]
+                max_new_tokens = tf.maximum(max_len - new_shape[1] - 1, 0)
+                batch_size = new_shape[0]
 
                 # 扩展 input_ids
                 """
@@ -170,7 +179,7 @@ class Trainstep:
                 print("Padding shape:", padding.shape)  # Debug info
                 
                 extended_input_ids = tf.concat([input_ids, padding], axis=1)
-                extended_attention_mask1 = tf.concat([attention_mask, tf.zeros((attention_mask.shape[0],
+                extended_attention_mask1 = tf.concat([attention_mask, tf.zeros((tf.shape(attention_mask)[0],
                                             max_new_tokens), dtype=attention_mask.dtype)], axis=1)
                 
                 print(f"Extended input_ids shape: {extended_input_ids.shape}")
@@ -203,14 +212,14 @@ class Trainstep:
                 extended_generated_embeddings = generated_embeddings + tf.expand_dims(style_embeddings, axis=1)
                 print("Generated extended embeddings shape:", extended_generated_embeddings.shape)  # Debug info
 
-                padded_input_ids = tf.pad(input_ids, [[0, 0], [0, generated_ids.shape[1] - input_ids.shape[1]]],
+                padded_input_ids = tf.pad(input_ids, [[0, 0], [0, tf.shape(generated_ids)[1] - tf.shape(input_ids)[1]]],
                                         "CONSTANT", constant_values=self.tokenizer.pad_token_id)
                 zx_distribution = dis.compute_distribution(extended_input_embeddings, self.dis_Z)
                 zy_distribution = dis.compute_distribution(extended_generated_embeddings, self.dis_Z)
                 kl_loss = dis.kl_divergence(zx_distribution, zy_distribution)
                 print("KL loss:", kl_loss)  # Debug info
 
-                extended_attention_mask2 = tf.pad(attention_mask, [[0, 0],[0, generated_ids.shape[1] - attention_mask.shape[1]]], 
+                extended_attention_mask2 = tf.pad(attention_mask, [[0, 0],[0, tf.shape(generated_ids)[1] - tf.shape(attention_mask)[1]]], 
                                             "CONSTANT", constant_values=1)
                 real_lm_loss_Y = dis.compute_lm_loss(generated_ids, extended_attention_mask2, self.dis_Y)
                 lm_loss = gamma * real_lm_loss_Y
@@ -287,18 +296,24 @@ class Trainstep:
     # REINFORCE算法
     # @tf.function
     def reinforce_step(self, input_ids, attention_mask, labels, style_ids, max_len):
+        """
+        still, we reshape and repeat the input tensor
+        """
+        actual_shape = tf.shape(input_ids)
+        input_ids = tf.reshape(input_ids, (actual_shape[0] * actual_shape[1], actual_shape[2]))
+        attention_mask = tf.reshape(attention_mask, (actual_shape[0] * actual_shape[1], actual_shape[2]))
+
+        styles = tf.repeat(styles, repeats=actual_shape[0])
+        labels = tf.repeat(labels, repeats=actual_shape[0], axis=0)
+
         with tf.GradientTape() as tape:
+            # Debug first
             print("input_ids shape:", input_ids.shape)
             print("attention_mask shape:", attention_mask.shape)
             print("style_ids shape:", style_ids.shape)
             style_ids = tf.expand_dims(style_ids, axis=1)
             print("Max_length:", max_len)
             print("Fixed max length:", tf.get_static_value(max_len))
-
-            """
-            we also need to remove the leading dimension
-            """
-            input_ids, attention_mask = pr.remove_leading_dim(input_ids, attention_mask)
 
             generated_ids = self.gen.generate(input_ids, attention_mask=attention_mask, max_length=max_len)
             print("Generated IDs shape:", generated_ids.shape)
@@ -328,12 +343,16 @@ class Trainstep:
     # @tf.function
     def train_discriminator_Y_step(self, real_ids, real_mask, input_ids, attention_mask, max_len, gamma=1.0):
         """
-        remove the leading dimension
+        reshape and repeat the relevant tensor
         """
-        real_ids, real_mask = pr.remove_leading_dim(real_ids, real_mask)
-        input_ids, attention_mask = pr.remove_leading_dim(input_ids, attention_mask)
+        actual_real_shape = tf.shape(real_ids)
+        real_ids = tf.reshape(real_ids, (actual_real_shape[0] * actual_real_shape[1], actual_real_shape[2]))
+        real_mask = tf.reshape(real_mask, (actual_real_shape[0] * actual_real_shape[1], actual_real_shape[2]))
+        actual_predict_shape = tf.shape(input_ids)
+        predict_ids = tf.reshape(predict_ids, (actual_predict_shape[0] * actual_predict_shape[1], actual_predict_shape[2]))
+        predict_mask = tf.reshape(predict_mask, (actual_predict_shape[0] * actual_predict_shape[1], actual_predict_shape[2]))
 
-        generated_ids = self.gen.generate(input_ids, attention_mask=attention_mask, max_length=max_len)
+        generated_ids = self.gen.generate(predict_ids, attention_mask=predict_mask, max_length=max_len)
         print(f"generated_ids.shape {generated_ids.shape} and real_ids.shape {real_ids.shape} and real_mask.shape {real_mask.shape}")
         with tf.GradientTape() as tape:
             real_loss = dis.compute_lm_loss(real_ids, real_mask, self.dis_Y)
@@ -357,7 +376,9 @@ class Trainstep:
         zx_loss = bce(tf.ones_like(self.dis_Z(zx)), self.dis_Z(zx))
         zy_loss = bce(tf.zeros_like(self.dis_Z(zy)), self.dis_Z(zy))
         print("Discriminator Z loss calculated")  # 调试信息
-        return zx_loss + zy_loss
+        total_loss = tf.reduce_mean(zx_loss + zy_loss)
+        return total_loss
+
 
     # 训练鉴别器z
     # @tf.function
@@ -379,10 +400,15 @@ class Trainstep:
         style_ids_Y = tf.expand_dims(style_ids_Y, axis=1)
 
         """
-        remove the leading dimension
+        reshape and repeat the relevant tensor
         """
-        input_ids_X, attention_mask_X = pr.remove_leading_dim(input_ids_X, attention_mask_X)
-        input_ids_Y, attention_mask_Y = pr.remove_leading_dim(input_ids_Y, attention_mask_Y)
+        actual__X_shape = tf.shape(input_ids_X)
+        input_ids_X = tf.reshape(input_ids_X, (actual__X_shape[0] * actual__X_shape[1], actual__X_shape[2]))
+        attention_mask_X = tf.reshape(attention_mask_X, (actual__X_shape[0] * actual__X_shape[1], actual__X_shape[2]))
+        actual_Y_shape = tf.shape(input_ids_Y)
+        input_ids_Y = tf.reshape(input_ids_Y, (actual_Y_shape[0] * actual_Y_shape[1], actual_Y_shape[2]))
+        attention_mask_Y = tf.reshape(attention_mask_Y, (actual_Y_shape[0] * actual_Y_shape[1], actual_Y_shape[2]))
+
 
         generated_ids_X_Z = self.gen.generate(input_ids_X, attention_mask=attention_mask_X, max_length=max_len)
         generated_ids_Y_Z = self.gen.generate(input_ids_Y, attention_mask=attention_mask_Y, max_length=max_len)
