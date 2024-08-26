@@ -1,6 +1,6 @@
 from transformers import GPT2Tokenizer, TFGPT2LMHeadModel
 import tensorflow as tf
-from tensorflow.keras.mixed_precision import set_global_policy
+# from tensorflow.keras.mixed_precision import set_global_policy
 
 # 损失函数
 def compute_perplexity(logits, labels, tokenizer):
@@ -57,13 +57,26 @@ def pad_sequences(sequences, padding_val=0):
 def create_attention_mask(sequences):
     return [[1 if token !=0 else 0 for token in seq] for seq in sequences]
 
+
+import tensorflow as tf
+
+# 动态padding
+@tf.function
 def dynamic_padding(batch_input_ids, batch_attention_mask):
-    max_len = max(len(seq) for seq in batch_input_ids)
-    print("max_len:", max_len)
-    padded_input_ids = tf.keras.preprocessing.sequence.pad_sequences(batch_input_ids, maxlen=max_len, padding='post')
-    # print("attention_mask:", batch_attention_mask)
-    padded_attention_mask = tf.keras.preprocessing.sequence.pad_sequences(batch_attention_mask, maxlen=max_len, padding='post')
-    # print("later attention_mask:", padded_attention_mask)
+    strategy = tf.distribute.get_strategy()
+
+    @tf.function
+    def step_fn(batch_input_ids, batch_attention_mask):
+        max_len = tf.reduce_max(tf.map_fn(lambda x: tf.shape(x)[0], batch_input_ids))
+        padded_input_ids = tf.pad(batch_input_ids, [[0, 0], [0, max_len - tf.shape(batch_input_ids)[1]]])
+        padded_attention_mask = tf.pad(batch_attention_mask, [[0, 0], [0, max_len - tf.shape(batch_attention_mask)[1]]])
+        return max_len, padded_input_ids, padded_attention_mask
+
+    per_replica_results = strategy.run(step_fn, args=(batch_input_ids, batch_attention_mask))
+    max_len = tf.reduce_max(strategy.experimental_local_results(per_replica_results[0]))
+    padded_input_ids = strategy.experimental_local_results(per_replica_results[1])
+    padded_attention_mask = strategy.experimental_local_results(per_replica_results[2])
+    
     return max_len, padded_input_ids, padded_attention_mask
 
 # 对抗损失
@@ -81,7 +94,7 @@ def compute_adversarial_loss(real_logits, generated_logits):
     return total_loss
 
 # 处理输入张量
-def convert_to_tensor(input_ids, attention_mask, labels, styles):
+def convert_tensor(input_ids, attention_mask, labels, styles):
     input_ids = tf.convert_to_tensor(input_ids, dtype=tf.int32)
     attention_mask = tf.convert_to_tensor(attention_mask, dtype=tf.int32)
     labels = tf.convert_to_tensor(labels, dtype=tf.int32)
