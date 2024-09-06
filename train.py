@@ -7,7 +7,6 @@ import discriminator as dis
 import pre_progress as pr
 import model as md
 import numpy as np
-import logging
 import datetime
 
 # 日志级别
@@ -25,12 +24,10 @@ tf.config.optimizer.set_jit(False)  # 禁用 XLA
 # 日志调试
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-# 紧急执行
-# tf.config.run_functions_eagerly(True)
 
 # 混合精度
-# from tensorflow.keras.mixed_precision import set_global_policy
-# set_global_policy('mixed_float16')
+from tensorflow.keras.mixed_precision import set_global_policy
+set_global_policy('mixed_float16')
 
 
 # 获取当前文件路径
@@ -39,40 +36,11 @@ file_path_X = os.path.join(current_dir, './corpus/X_corpus.txt')
 file_path_Y = os.path.join(current_dir, './corpus/Y_corpus.txt')
 test_file_path = os.path.join(current_dir, './corpus/test_corpus.txt')
 
-accumulated_gradients = None
+# TensorBoard
+current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+log_dir = 'logs/' + current_time
 
-
-# # 检查点
-# from multiprocessing import util
-# checkpoint_dir = os.path.join(util.get_temp_dir(), 'ckpt')
-
-# def _is_chief(task_type, task_id, cluster_spec):
-#   return (task_type is None
-#           or task_type == 'chief'
-#           or (task_type == 'worker'
-#               and task_id == 0
-#               and "chief" not in cluster_spec.as_dict()))
-
-# def _get_temp_dir(dirpath, task_id):
-#   base_dirpath = 'workertemp_' + str(task_id)
-#   temp_dir = os.path.join(dirpath, base_dirpath)
-#   tf.io.gfile.makedirs(temp_dir)
-#   return temp_dir
-
-# def write_filepath(filepath, task_type, task_id, cluster_spec):
-#   dirpath = os.path.dirname(filepath)
-#   base = os.path.basename(filepath)
-#   if not _is_chief(task_type, task_id, cluster_spec):
-#     dirpath = _get_temp_dir(dirpath, task_id)
-#   return os.path.join(dirpath, base)
-
-# checkpoint = tf.train.Checkpoint(generator=generator, discriminator_Y=discriminator_Y, discriminator_Z=discriminator_Z)
-# write_checkpoint_dir = write_filepath(checkpoint_dir, task_type, task_id, cluster_spec)
-# checkpoint_manager = tf.train.CheckpointManager(checkpoint, directory=write_checkpoint_dir, max_to_keep=1)
-
-# lastest_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
-# if lastest_checkpoint:
-#     checkpoint.restore(lastest_checkpoint)
+tensorboard_callback = TensorBoard(log_dir=log_dir, histogram_freq=1, profile_batch='2,5')
 
 
 # 训练
@@ -92,15 +60,18 @@ class Train:
 
 
     def update_metrics(self, **kwargs) -> None:
-        for name, value in kwargs.items():
-            if name in self.metrics:
-                if isinstance(value, tf.Tensor):
-                    value = value.numpy()  
-                if np.isscalar(value):  
-                    self.metrics[name].update_state(value)
-                else:
-                    raise ValueError(f"Expected scalar value for metric '{name}', but got {type(value)}")
-                
+        def update_fn(metrics, **values):
+            for name, value in values.items():
+                if name in metrics:
+                    if isinstance(value, tf.Tensor):
+                        value = value.numpy()  
+                    if np.isscalar(value):  
+                        metrics[name].update_state(value)
+                    else:
+                        raise ValueError(f"Expected scalar value for metric '{name}', but got {type(value)}")
+
+        self.strategy.run(update_fn, args=(self.metrics,), kwargs=kwargs)        
+
 
     def reset_metrics(self):
         for metric in self.metrics.values():
@@ -125,16 +96,31 @@ class Train:
             else:
                 new_kwargs[key] = tf.convert_to_tensor(value)
         
+
+        def generator_step(*args, **kwargs):
+            loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy, gradients = self.model.train_generator_step(*args, **kwargs)
+            self.model.gen_optimizer.apply_gradients(zip(gradients, self.model.gen.trainable_variables))
+            return loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy
+
+        # input_ids, attention_mask, labels, styles = pr.distribute_data(input_ids, attention_mask, labels, styles)
         loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy = self.strategy.run(
-            self.model.train_generator_step, 
+            generator_step, 
             args=(batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X, *new_args), 
             kwargs=new_kwargs
         )
+
+        print("Generator graidents applied")
         total_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, loss, axis=None)
-        return loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy, total_loss
+        rec_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, rec_loss, axis=None)
+        lm_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, lm_loss, axis=None)
+        adv_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, adv_loss, axis=None)
+        kl_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, kl_loss, axis=None)
+        current_lr = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, current_lr, axis=None)
+        accuracy = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, accuracy, axis=None)
+        return rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy, total_loss
 
 
-    def distributed_train_reinforce_step(self, *args, **kwargs):
+    def distributed_train_reinforce_step(self, batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X, *args, **kwargs):
         new_args = []
         for arg in args:
             if not isinstance(arg, tf.Tensor):
@@ -148,11 +134,23 @@ class Train:
             else:
                 new_kwargs[key] = tf.convert_to_tensor(value)
 
-        reinforce_loss = self.strategy.run(self.model.reinforce_step, args=(new_args), kwargs=new_kwargs)
+
+        def reinforce_step(*args, **kwargs):
+            reinforce_loss, gradients = self.model.reinforce_step(*args, **kwargs)
+            self.model.gen_optimizer.apply_gradients(zip(gradients, self.model.gen.trainable_variables))
+            return reinforce_loss
+
+
+        reinforce_loss = self.strategy.run(
+            reinforce_step, 
+            args=(batch_input_ids_X, batch_attention_mask_X, batch_labels_X, batch_styles_X, *new_args), 
+            kwargs=new_kwargs
+        )
+        print("Reinforce graidents applied")
         return self.strategy.reduce(tf.distribute.ReduceOp.MEAN, reinforce_loss, axis=None)
 
 
-    def distributed_train_discriminator_Y_step(self, *args, **kwargs):
+    def distributed_train_discriminator_Y_step(self, batch_input_ids_Y, batch_attention_mask_Y, batch_input_ids_X, batch_attention_mask_X, *args, **kwargs):
         new_args = []
         for arg in args:
             if not isinstance(arg, tf.Tensor):
@@ -166,12 +164,24 @@ class Train:
             else:
                 new_kwargs[key] = tf.convert_to_tensor(value)
 
-        disc_loss_Y, real_loss_Y, fake_loss_Y = self.strategy.run(self.model.train_discriminator_Y_step, args=(*new_args,), kwargs=new_kwargs)
+
+        def discriminator_Y_step(*args, **kwargs):
+            reinforce_loss, gradients = self.model.train_discriminator_Y_step(*args, **kwargs)
+            self.model.dis_Y_optimizer.apply_gradients(zip(gradients, self.model.dis_Y.trainable_variables))
+            return reinforce_loss
+
+
+        disc_loss_Y = self.strategy.run(
+            discriminator_Y_step, 
+            args=(batch_input_ids_Y, batch_attention_mask_Y, batch_input_ids_X, batch_attention_mask_X, *new_args), 
+            kwargs=new_kwargs
+        )
+        print("Discriminator Y graidents applied")
         total_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, disc_loss_Y, axis=None)
-        return disc_loss_Y, real_loss_Y, fake_loss_Y, total_loss
+        return total_loss
 
 
-    def distributed_train_discriminator_Z_step(self, *args, **kwargs):
+    def distributed_train_discriminator_Z_step(self, batch_input_ids_X, batch_attention_mask_X, batch_styles_X, *args, **kwargs):
         new_args = []
         for arg in args:
             if not isinstance(arg, tf.Tensor):
@@ -185,25 +195,52 @@ class Train:
             else:
                 new_kwargs[key] = tf.convert_to_tensor(value)
 
-        disc_z_loss_X, disc_z_loss_Y = self.strategy.run(self.model.train_generator_with_discriminator_Z, args=new_args, kwargs=new_kwargs)
-        total_Z_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, (disc_z_loss_X + disc_z_loss_Y) / 2.0, axis=None)
-        return disc_z_loss_X, disc_z_loss_Y, total_Z_loss
+
+        def discriminator_Z_step(*args, **kwargs):
+            disc_z_loss, gradients = self.model.train_generator_with_discriminator_Z(*args, **kwargs)
+
+            tf.print("disc_z_loss:", disc_z_loss)
+            tf.print("gradients length:", len(gradients))
+            for i, grad in enumerate(gradients):
+                if grad is not None:
+                    tf.print(f"gradient {i} stats:", 
+                            "shape:", tf.shape(grad), 
+                            "dtype:", grad.dtype, 
+                            "mean:", tf.reduce_mean(grad), 
+                            "max:", tf.reduce_max(grad), 
+                            "min:", tf.reduce_min(grad))
+                else:
+                    tf.print(f"gradient {i} is None")
+
+            self.model.dis_Z_optimizer.apply_gradients(zip(gradients, self.model.dis_Z.trainable_variables))
+            return disc_z_loss
+
+
+        disc_z_loss = self.strategy.run(
+            discriminator_Z_step, 
+            args=(batch_input_ids_X, batch_attention_mask_X, batch_styles_X, *new_args), 
+            kwargs=new_kwargs
+        )
+        print("Discriminator_Z graidents applied")
+        loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, disc_z_loss, axis=None)
+        return loss
     
+    def print_labels(self, train_batch, labels):
+        def print_(train_batch, labels):
+            if (train_batch == 0):
+                print("labels:", labels)
+        self.strategy.run(print_, args=(train_batch, labels))
 
     def train(self, train_tf_dataset_X, train_tf_dataset_Y, valid_tf_dataset_X, valid_tf_dataset_Y, epochs, *args, **kwargs):
-        print("Before Train start, test the dataset_X first:")
-        for element in train_tf_dataset_X.take(1):
-            print("ids:", element['input_ids'])
-            print("mask:", element['attention_mask'])
-            print("style:", element['style'])
         train_dist_dataset_X = self.strategy.experimental_distribute_dataset(train_tf_dataset_X)
         train_dist_dataset_Y = self.strategy.experimental_distribute_dataset(train_tf_dataset_Y)
-        valid_dist_dataset_X = self.strategy.experimental_distribute_dataset(valid_tf_dataset_X)
 
+        """
+        for validate, we donnot need to distribute the dataset
+        """
         for epoch in range(epochs):
             self.reset_metrics()
             train_batch = 0
-            valid_batch = 0
 
             for batch_X, batch_Y in zip(train_dist_dataset_X, train_dist_dataset_Y):
                 print(f"Train Epoch {epoch + 1} started, batch {train_batch + 1}")
@@ -219,7 +256,7 @@ class Train:
                 # 动态 Padding
                 max_len_X, batch_input_ids_X, batch_attention_mask_X = dis.dynamic_padding(batch_input_ids_X, batch_attention_mask_X)
                 max_len_Y, batch_input_ids_Y, batch_attention_mask_Y = dis.dynamic_padding(batch_input_ids_Y, batch_attention_mask_Y)
-                max_len = tf.reduce_max(tf.stack([max_len_X, max_len_Y])) + 11
+                max_len = tf.reduce_max(tf.stack([max_len_X, max_len_Y])) + 51
                 print("max_len:", max_len)
 
                 batch_input_ids_X = tf.convert_to_tensor(batch_input_ids_X, dtype=tf.int32)
@@ -232,21 +269,28 @@ class Train:
                 print("batch_input_ids_Y shape:", batch_input_ids_Y.shape)
                 print("batch_attention_mask_Y.shape:", batch_attention_mask_Y.shape)
 
+                # print("batch input_ids X:", batch_input_ids_X)
+
+                tf.profiler.experimental.start(log_dir)
+                
                 print("Training gen")
-                loss, rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy, total_gen_loss = self.distributed_train_generator_step(
-                    batch_input_ids_X,
-                    batch_attention_mask_X,
-                    batch_labels_X,
-                    batch_styles_X,
-                    max_len, 
-                    tf.cast(self.config.lr_step, tf.float32), 
-                    accumulation_steps=self.config.accumulation_steps,
-                    lambda_rec=self.config.lambda_rec, 
-                    lambda_lm=self.config.lambda_lm, 
-                    lambda_adv=self.config.lambda_adv, 
-                    lambda_kl=self.config.lambda_kl, 
-                    gamma=self.config.gamma
-                )
+                with tf.profiler.experimental.Trace('train_generator_step', step_num=train_batch, _r=1):
+                    rec_loss, lm_loss, adv_loss, kl_loss, current_lr, accuracy, total_gen_loss = self.distributed_train_generator_step(
+                        batch_input_ids_X,
+                        batch_attention_mask_X,
+                        batch_labels_X,
+                        batch_styles_X,
+                        max_len, 
+                        tf.cast(self.config.lr_step, tf.float32), 
+                        accumulation_steps=self.config.accumulation_steps,
+                        lambda_rec=self.config.lambda_rec, 
+                        lambda_lm=self.config.lambda_lm, 
+                        lambda_adv=self.config.lambda_adv, 
+                        lambda_kl=self.config.lambda_kl, 
+                        gamma=self.config.gamma
+                    )
+
+                tf.profiler.experimental.stop()
                 
                 print("Training REINFORCE")
                 reinforce_loss = self.distributed_train_reinforce_step(
@@ -255,30 +299,29 @@ class Train:
                     batch_labels_X, 
                     batch_styles_X, 
                     max_len,
+                    accumulation_steps=self.config.accumulation_steps
                 )
 
                 print("Training discriminator Y")
-                disc_loss_Y, real_loss_Y, fake_loss_Y, total__Y_loss = self.distributed_train_discriminator_Y_step(
+                total__Y_loss = self.distributed_train_discriminator_Y_step(
                     batch_input_ids_Y, 
                     batch_attention_mask_Y, 
                     batch_input_ids_X,
                     batch_attention_mask_X,
                     max_len, 
+                    accumulation_steps=self.config.accumulation_steps,
                     gamma=self.config.gamma
                 )
                 
                 print("Training discriminator Z")
-                disc_z_loss_X, disc_z_loss_Y, total_Z_loss = self.distributed_train_discriminator_Z_step(
+                total_Z_loss = self.distributed_train_discriminator_Z_step(
                     batch_input_ids_X, 
-                    batch_input_ids_Y, 
                     batch_attention_mask_X, 
-                    batch_attention_mask_Y, 
                     batch_styles_X, 
-                    batch_styles_Y, 
-                    max_len, 
+                    accumulation_steps=self.config.accumulation_steps,
                     label_smoothing=self.config.label_smoothing
                 )
-                
+
                 self.update_metrics(
                     train_loss=total_gen_loss,
                     train_accuracy=accuracy,
@@ -290,43 +333,77 @@ class Train:
                     disc_z_loss=total_Z_loss,
                     reinforce_loss=reinforce_loss,
                 )
+
                 self.config.lr_step += 1
                 print(f"Train Epoch {epoch + 1} completed")
                 train_batch += 1
                 self.append_to_config_lr(current_lr)
 
-            for batch_valid_X in valid_dist_dataset_X:
-                print(f"Valid Epoch {epoch + 1} started, batch {valid_batch + 1}")
-
-                batch_valid_ids, batch_valid_attention_mask, batch_valid_labels, batch_valid_styles = pr.get_params(batch_valid_X)
-
-                batch_valid_ids = tf.convert_to_tensor(batch_valid_ids, dtype=tf.int32)
-                batch_valid_attention_mask = tf.convert_to_tensor(batch_valid_attention_mask, dtype=tf.int32)
-                print("batch_valid_ids shape:", tf.shape(batch_valid_ids))
-                print("batch_valid_attention_mask shape:", tf.shape(batch_valid_attention_mask))
-
-                valid_loss, valid_accuracy = ex.valid_step(
-                    self.model.gen, 
-                    self.model.embedding,
-                    batch_valid_ids, 
-                    batch_valid_attention_mask, 
-                    batch_valid_labels, 
-                    batch_valid_styles
-                )
-
-                self.update_metrics(
-                    valid_loss=valid_loss,
-                    valid_accuracy=valid_accuracy
-                )
-                print(f"Valid Epoch {epoch + 1} completed")
-                valid_batch += 1
+            self.validate(epoch, valid_tf_dataset_X)
 
             perplexity = tf.exp(self.metrics['valid_loss'].result())
-            self.metrics['valid_perplexity'].update_state(perplexity)
+            self.update_metrics(valid_perplexity=perplexity)
             self.print_epoch_results()
             self.append_to_config()
             print(f"Epoch {epoch + 1} completed")
             epoch += 1
+
+
+    def validate(self, epoch, valid_tf_dataset_X):
+        def val_step(batch):
+            batch_valid_ids, batch_valid_attention_mask, batch_valid_labels, batch_valid_styles = ex.get_params(batch) # we use ex.py function
+
+            batch_valid_ids = tf.convert_to_tensor(batch_valid_ids, dtype=tf.int32)
+            batch_valid_attention_mask = tf.convert_to_tensor(batch_valid_attention_mask, dtype=tf.int32)
+
+            valid_loss, valid_accuracy = ex.valid_step(
+                self.model.gen, 
+                self.model.embedding,
+                batch_valid_ids, 
+                batch_valid_attention_mask, 
+                batch_valid_labels, 
+                batch_valid_styles
+            )
+
+            return valid_loss, valid_accuracy
+
+        def validate_on_chief(epoch, dataset):
+            valid_batch = 0
+            for batch_valid_X in dataset:
+                print(f"Valid Epoch {epoch + 1} started, batch {valid_batch + 1}")
+
+                valid_loss, valid_accuracy = val_step(batch_valid_X)
+
+                tf.distribute.get_replica_context().merge_call(
+                    lambda strategy: self.update_metrics_distributed(valid_loss, valid_accuracy)
+                )
+
+                print(f"Valid Epoch {epoch + 1}, batch {valid_batch + 1} completed")
+                valid_batch += 1
+
+            print(f"Valid Epoch {epoch + 1} completed")
+
+        def distributed_validate(epoch, dataset):
+            if tf.equal(tf.distribute.get_replica_context().replica_id_in_sync_group, 0):  # The master copy performs validation
+                validate_on_chief(epoch, dataset)
+            else:
+                # Ensure all replicas call merge_call the same number of times
+                for _ in dataset:
+                    tf.distribute.get_replica_context().merge_call(lambda strategy: None)
+
+        self.strategy.run(distributed_validate, args=(epoch, valid_tf_dataset_X))
+
+
+    def update_metrics_distributed(self, valid_loss, valid_accuracy):
+        def update_fn(valid_loss, valid_accuracy):
+            if isinstance(valid_loss, tf.Tensor):
+                valid_loss = valid_loss.numpy()
+            if isinstance(valid_accuracy, tf.Tensor):
+                valid_accuracy = valid_accuracy.numpy()
+            self.metrics['valid_loss'].update_state(valid_loss)
+            self.metrics['valid_accuracy'].update_state(valid_accuracy)
+
+        self.strategy.run(update_fn, args=(valid_loss, valid_accuracy))
 
 
     def append_to_config(self):
@@ -365,23 +442,10 @@ class Train:
 
 
 # 实例化并训练
-import json
-
-# 先设置环境变量
-# os.environ['TF_CONFIG'] = json.dumps({
-#     'cluster': {
-#         "chief": ["host1:2222"],
-#         "worker": ["host2:2222", "host3:2222", "host4:2222"]
-#     },
-#     "task": {"type": "worker", "index": 1}
-# })
-
-# communication_options = tf.distribute.experimental.CommunicationOptions(implementation=tf.distribute.experimental.CommunicationImplementation.NCCL)
-# mirrored_strategy = tf.distribute.MirroredStrategy()
 mirrored_strategy = tf.distribute.MirroredStrategy()
 
 with mirrored_strategy.scope():
-    generator, discriminator_Y, discriminator_Z, tokenizer = md.create_model()
+    generator, discriminator_Y, discriminator_Z, intermediate_model, tokenizer = md.create_model()
 
     trainconfig = pr.TrainConfig()
 
@@ -414,7 +478,8 @@ with mirrored_strategy.scope():
         discriminator_Y, 
         dis_Y_optimizer, 
         discriminator_Z, 
-        dis_Z_optimizer, 
+        dis_Z_optimizer,
+        intermediate_model, 
         tokenizer, 
         embedding, 
         mirrored_strategy,
