@@ -128,11 +128,18 @@ def plot_losses(rec_losses, lm_losses, adv_losses, kl_losses, disc_losses, disc_
     plt.savefig(os.path.join(save_dir, 'losses.png'))
     plt.close()
 
-# 验证和测试步骤
-# @tf.function
-def valid_step(gen, embedding, input_ids, attention_mask, labels, styles):
-    input_ids, attention_mask = pr.remove_leading_dim(input_ids, attention_mask)
+# 测试集相关
+def get_params(batch_X):
+    input_ids = batch_X['input_ids']
+    attention_mask = batch_X['attention_mask']
+    labels = create_labels(input_ids, attention_mask)
+    style = batch_X['style']
+    return input_ids, attention_mask, labels, style
 
+
+# 验证和测试步骤
+@tf.function
+def valid_step(gen, embedding, input_ids, attention_mask, labels, styles):
     """
     we embed the style ID into the same embedding space as the input IDs
     """
@@ -149,7 +156,7 @@ def valid_step(gen, embedding, input_ids, attention_mask, labels, styles):
     accuracy = tf.reduce_sum(tf.cast(tf.equal(predictions,labels), tf.float32) * mask) / tf.reduce_sum(mask)
     return tf.cast(loss, tf.float32), accuracy
 
-# @tf.function
+@tf.function
 def test_step(gen, input_ids, attention_mask, labels, styles):
     input_ids = tf.convert_to_tensor(input_ids, dtype=tf.int32)
     attention_mask = tf.convert_to_tensor(attention_mask, dtype=tf.int32)
