@@ -11,6 +11,7 @@ def compute_perplexity(logits, labels, tokenizer):
     perplexity = tf.exp(loss)
     return perplexity
 
+
 def compute_discriminator_loss(real_texts, generated_texts, model, tokenizer, gamma=0):
     real_inputs = tokenizer(real_texts, return_tensors='tf', padding=True, truncation=True)
     generated_inputs = tokenizer(generated_texts, return_tensors='tf', padding=True, truncation=True)
@@ -23,39 +24,62 @@ def compute_discriminator_loss(real_texts, generated_texts, model, tokenizer, ga
     return loss_real + gamma * loss_generated
 
 def compute_lm_loss(input_ids, real_mask, language_model):
+    input_ids = tf.cast(input_ids, tf.float32)
+    real_mask = tf.cast(real_mask, tf.float32)
     outputs = language_model(input_ids, attention_mask=real_mask, training=True)
     logits = outputs.logits
     shift_logits = logits[:,:-1,:]
     shift_labels = input_ids[:,1:]
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
     loss = loss_fn(shift_labels, shift_logits)
+    loss = tf.cast(loss, tf.float32)
     loss = tf.clip_by_value(loss, 1e-8, 1e8)
     return tf.reduce_mean(loss)
+
 
 # 鉴别器数据处理函数
 def encode_texts(texts, tokenizer, max_length=512):
     inputs = tokenizer(texts, return_tensors='tf', max_length=max_length, padding='max_length', truncation=True)
     return inputs['input_ids'], inputs['attention_mask']
 
-# KL散度正则化
-def kl_divergence(zx_distribution, zy_distribution):
-    epsilon = 1e-8
-    kl_loss = tf.reduce_mean(zx_distribution * tf.math.log((zx_distribution + epsilon) / (zy_distribution + epsilon)))
-    return tf.clip_by_value(kl_loss, -1e3, 1e3)
 
-# 定义计算内容分布的函数
-def compute_distribution(input_ids, dis_Z):
-    outputs = dis_Z(input_ids)
+# 计算内容向量
+def compute_distribution(input_embeddings, intermediate_model):
+    input_embeddings = tf.cast(input_embeddings, tf.float32)
+    
+    outputs = intermediate_model(input_embeddings)
+    
     content_vector = tf.reduce_mean(outputs, axis=1)
+    
+    print(f"Content vector shape: {content_vector.shape}")
+    
     return content_vector
 
-# 动态padding
-def pad_sequences(sequences, padding_val=0):
-    max_len = max(len(seq) for seq in sequences)
-    return [seq + [padding_val] * (max_len - len(seq)) for seq in sequences]
 
-def create_attention_mask(sequences):
-    return [[1 if token !=0 else 0 for token in seq] for seq in sequences]
+# KL散度正则化函数保持不变
+def kl_divergence(zx_distribution, zy_distribution):
+    epsilon = 1e-8
+    zx_distribution = tf.cast(zx_distribution, tf.float32)
+    zy_distribution = tf.cast(zy_distribution, tf.float32)
+
+    safe_zx = tf.clip_by_value(zx_distribution, epsilon, 1.0 - epsilon)
+    safe_zy = tf.clip_by_value(zy_distribution, epsilon, 1.0 - epsilon)
+
+    try:
+        safe_zx = tf.debugging.check_numerics(safe_zx, "NaN or Inf in safe_zx")
+        safe_zy = tf.debugging.check_numerics(safe_zy, "NaN or Inf in safe_zy")
+
+        kl_loss = tf.reduce_mean(safe_zx * tf.math.log(safe_zx / safe_zy))
+
+        kl_loss = tf.debugging.check_numerics(kl_loss, "NaN or Inf in kl_loss")
+
+        kl_loss =  tf.clip_by_value(kl_loss, -1e2, 1e2)
+    except tf.errors.InvalidArgumentError as e:
+        print("Exception caught:", e.message)
+        print("safe_zx:", safe_zx.numpy())
+        print("safe_zx:", safe_zy.numpy())
+        raise
+    return kl_loss
 
 
 import tensorflow as tf
@@ -79,19 +103,21 @@ def dynamic_padding(batch_input_ids, batch_attention_mask):
     
     return max_len, padded_input_ids, padded_attention_mask
 
+
 # 对抗损失
 def compute_adversarial_loss(real_logits, generated_logits):
     # 使用sigmoid交叉熵损失
     loss_fn = tf.keras.losses.BinaryCrossentropy(from_logits=True, reduction='none')
     
     # 真实样本的目标是1，生成样本的目标是0
-    real_loss = loss_fn(tf.ones_like(real_logits), real_logits)
-    generated_loss = loss_fn(tf.zeros_like(generated_logits), generated_logits)
+    real_loss = tf.cast(loss_fn(tf.ones_like(real_logits), real_logits), tf.float32)
+    generated_loss = tf.cast(loss_fn(tf.zeros_like(generated_logits), generated_logits), tf.float32)
     
     # 计算平均损失
     total_loss = tf.reduce_mean(real_loss) + tf.reduce_mean(generated_loss)
     
     return total_loss
+
 
 # 处理输入张量
 def convert_tensor(input_ids, attention_mask, labels, styles):
@@ -100,6 +126,7 @@ def convert_tensor(input_ids, attention_mask, labels, styles):
     labels = tf.convert_to_tensor(labels, dtype=tf.int32)
     styles = tf.convert_to_tensor(styles, dtype=tf.int32)
     return input_ids, attention_mask, labels, styles
+
 
 # 显示生成id
 def generate_with_float32(gen, input_ids, attention_mask, **kwargs):
